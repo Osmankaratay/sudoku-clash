@@ -1,0 +1,84 @@
+{
+  "entities": {
+    "User": {
+      "title": "User",
+      "description": "Authenticated player account profile, settings, and stats.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "Unique user ID matching Auth UID." },
+        "username": { "type": "string", "description": "Player handle name.", "maxLength": 24 },
+        "email": { "type": "string", "description": "User email address for account recovery." },
+        "avatarId": { "type": "string", "description": "Selected avatar insignia identifier." },
+        "createdAt": { "type": "string", "format": "date-time", "description": "Account registration timestamp." },
+        "updatedAt": { "type": "string", "format": "date-time", "description": "Last profile update timestamp." }
+      },
+      "required": ["id", "username", "createdAt"]
+    },
+    "PublicProfile": {
+      "title": "PublicProfile",
+      "description": "Publicly visible competitor card without sensitive data.",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string", "description": "Owner user UID." },
+        "username": { "type": "string", "description": "Display name.", "maxLength": 24 },
+        "avatarId": { "type": "string", "description": "Avatar badge insignia." },
+        "gamesPlayed": { "type": "number", "description": "Total competitive matches played." },
+        "gamesWon": { "type": "number", "description": "Total competitive matches won." },
+        "bestScore": { "type": "number", "description": "All-time highest match score." },
+        "updatedAt": { "type": "string", "format": "date-time", "description": "Last update timestamp." }
+      },
+      "required": ["userId", "username", "avatarId"]
+    },
+    "LeaderboardEntry": {
+      "title": "LeaderboardEntry",
+      "description": "Verified tournament or speed record on a specific puzzle seed.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "Unique leaderboard entry ID." },
+        "userId": { "type": "string", "description": "Author user UID." },
+        "playerName": { "type": "string", "description": "Player display name.", "maxLength": 24 },
+        "avatarId": { "type": "string", "description": "Player avatar badge ID." },
+        "puzzleSeed": { "type": "string", "description": "Sudoku generator seed." },
+        "difficulty": { "type": "string", "enum": ["Easy", "Medium", "Hard", "Expert", "Master", "Pro"], "description": "Puzzle difficulty." },
+        "mistakes": { "type": "number", "description": "Mistakes count." },
+        "finishTimeMs": { "type": "number", "description": "Completion time in milliseconds." },
+        "score": { "type": "number", "description": "Calculated final score points." },
+        "createdAt": { "type": "string", "format": "date-time", "description": "Completion timestamp." }
+      },
+      "required": ["id", "userId", "playerName", "puzzleSeed", "difficulty", "mistakes", "finishTimeMs", "score"]
+    },
+    "MatchRecord": {
+      "title": "MatchRecord",
+      "description": "Historical multiplayer room match summary.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "Match room ID or record ID." },
+        "roomCode": { "type": "string", "description": "6-character room code." },
+        "difficulty": { "type": "string", "description": "Room difficulty tier." },
+        "winnerId": { "type": "string", "description": "UID of the rank 1 finisher." },
+        "winnerName": { "type": "string", "description": "Display name of winner." },
+        "playerCount": { "type": "number", "description": "Total participants count." },
+        "completedAt": { "type": "string", "format": "date-time", "description": "Match finish timestamp." }
+      },
+      "required": ["id", "roomCode", "difficulty", "winnerName", "completedAt"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/User" },
+      "description": "Private user account profile and settings documents."
+    },
+    "/public_profiles/{userId}": {
+      "schema": { "$ref": "#/entities/PublicProfile" },
+      "description": "Public competitor profile documents accessible by all players."
+    },
+    "/leaderboards/{entryId}": {
+      "schema": { "$ref": "#/entities/LeaderboardEntry" },
+      "description": "Global puzzle seed records and all-time speed benchmarks."
+    },
+    "/matches/{matchId}": {
+      "schema": { "$ref": "#/entities/MatchRecord" },
+      "description": "Archive of completed tournament matches and rankings."
+    }
+  }
+}

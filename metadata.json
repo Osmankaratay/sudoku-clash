@@ -1,0 +1,6 @@
+{
+  "name": "Nueve: Competitive Multiplayer Sudoku",
+  "description": "Real-time multiplayer competitive Sudoku arena with unique backtracking board generation, 6 difficulty tiers, and live rank-interpolated scoring.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

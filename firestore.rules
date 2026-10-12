@@ -1,0 +1,123 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Default deny catch-all
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Helper functions
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() > 0 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    // Entity validation functions
+    function isValidUser(data) {
+      return data.id is string
+        && data.id.size() <= 128
+        && data.username is string
+        && data.username.size() >= 2
+        && data.username.size() <= 24
+        && (!('email' in data) || (data.email is string && data.email.size() <= 128))
+        && (!('avatarId' in data) || (data.avatarId is string && data.avatarId.size() <= 64))
+        && data.createdAt is string
+        && data.createdAt.size() <= 64;
+    }
+
+    function isValidPublicProfile(data) {
+      return data.userId is string
+        && data.userId.size() <= 128
+        && data.username is string
+        && data.username.size() >= 2
+        && data.username.size() <= 24
+        && data.avatarId is string
+        && data.avatarId.size() <= 64
+        && (!('gamesPlayed' in data) || (data.gamesPlayed is number && data.gamesPlayed >= 0))
+        && (!('gamesWon' in data) || (data.gamesWon is number && data.gamesWon >= 0))
+        && (!('bestScore' in data) || (data.bestScore is number && data.bestScore >= 0));
+    }
+
+    function isValidLeaderboardEntry(data) {
+      return data.id is string
+        && data.id.size() <= 128
+        && data.userId is string
+        && data.userId.size() <= 128
+        && data.userId == request.auth.uid
+        && data.playerName is string
+        && data.playerName.size() >= 2
+        && data.playerName.size() <= 24
+        && data.puzzleSeed is string
+        && data.puzzleSeed.size() <= 64
+        && data.difficulty in ['Easy', 'Medium', 'Hard', 'Expert', 'Master', 'Pro']
+        && data.mistakes is number
+        && data.mistakes >= 0
+        && data.finishTimeMs is number
+        && data.finishTimeMs > 0
+        && data.score is number
+        && data.score >= 0;
+    }
+
+    function isValidMatchRecord(data) {
+      return data.id is string
+        && data.id.size() <= 128
+        && data.roomCode is string
+        && data.roomCode.size() <= 16
+        && data.difficulty is string
+        && data.difficulty.size() <= 32
+        && data.winnerName is string
+        && data.winnerName.size() <= 32
+        && data.completedAt is string
+        && data.completedAt.size() <= 64;
+    }
+
+    // Rules for User Private Account Data
+    match /users/{userId} {
+      allow get: if isOwner(userId);
+      allow list: if false; // PII is isolated, no blanket listing
+      allow create: if isOwner(userId) && isValidUser(incoming()) && incoming().id == userId;
+      allow update: if isOwner(userId) && isValidUser(incoming()) && incoming().id == userId;
+      allow delete: if isOwner(userId);
+    }
+
+    // Rules for Public Player Profiles
+    match /public_profiles/{userId} {
+      allow read: if true;
+      allow create: if isOwner(userId) && isValidPublicProfile(incoming()) && incoming().userId == userId;
+      allow update: if isOwner(userId) && isValidPublicProfile(incoming()) && incoming().userId == userId;
+      allow delete: if isOwner(userId);
+    }
+
+    // Rules for Global Leaderboards
+    match /leaderboards/{entryId} {
+      allow read: if true;
+      allow create: if isSignedIn() && isValidId(entryId) && isValidLeaderboardEntry(incoming()) && incoming().id == entryId;
+      allow update: if false; // Leaderboard records are immutable achievements
+      allow delete: if isSignedIn() && existing().userId == request.auth.uid;
+    }
+
+    // Rules for Archived Match Records
+    match /matches/{matchId} {
+      allow read: if true;
+      allow create: if isSignedIn() && isValidId(matchId) && isValidMatchRecord(incoming()) && incoming().id == matchId;
+      allow update: if false; // Match records are immutable
+      allow delete: if false;
+    }
+  }
+}
