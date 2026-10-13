@@ -11,6 +11,8 @@ import {
   Trash2,
   SlidersHorizontal,
   UserCog,
+  ShieldAlert,
+  Users,
 } from 'lucide-react';
 import {
   DifficultyLevel,
@@ -25,7 +27,8 @@ interface LobbyScreenProps {
   room: RoomPublicState;
   currentPlayerId: string;
   onToggleReady: () => void;
-  onSetDifficulty: (difficulty: DifficultyLevel) => void;
+  onSetDifficulty: (difficulty: DifficultyLevel, customClues?: number) => void;
+  onSetMistakeLimit?: (limit: number) => void;
   onStartGame: () => void;
   onAddBot: () => void;
   onRemoveBot: (botId: string) => void;
@@ -42,6 +45,7 @@ export const LobbyScreen: React.FC<LobbyScreenProps> = ({
   currentPlayerId,
   onToggleReady,
   onSetDifficulty,
+  onSetMistakeLimit,
   onStartGame,
   onAddBot,
   onRemoveBot,
@@ -59,6 +63,7 @@ export const LobbyScreen: React.FC<LobbyScreenProps> = ({
   const readyCount = room.players.filter((p) => p.isReady).length;
   const totalCount = room.players.length;
   const allReady = totalCount > 0 && readyCount === totalCount;
+  const currentMistakeLimit = room.mistakeLimit ?? 3;
 
   const handleCopyCode = async () => {
     try {
@@ -89,7 +94,7 @@ export const LobbyScreen: React.FC<LobbyScreenProps> = ({
         </div>
       )}
 
-      {/* Top Room Banner: 6-Character Code & Difficulty Controls */}
+      {/* Top Room Banner: 6-Character Code, Difficulty Controls & Mistake Limit */}
       <div className="bg-[#131B2E] border border-slate-800/90 rounded-2xl p-4 sm:p-6 lg:p-7">
         <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4 sm:gap-6">
           {/* Room Code Block */}
@@ -97,8 +102,9 @@ export const LobbyScreen: React.FC<LobbyScreenProps> = ({
             <div className="flex items-center gap-1.5 sm:gap-2 text-xs text-slate-400">
               <span>Matchmaking Lobby</span>
               <span aria-hidden="true">·</span>
-              <span className="font-mono text-slate-300">
-                {totalCount}/{room.maxPlayers} Players
+              <span className="font-mono text-emerald-300 flex items-center gap-1 font-semibold">
+                <Users className="w-3.5 h-3.5" />
+                <span>{totalCount} Competitors (Unlimited)</span>
               </span>
               <span aria-hidden="true">·</span>
               <span className="text-amber-400 font-medium">
@@ -130,44 +136,141 @@ export const LobbyScreen: React.FC<LobbyScreenProps> = ({
             </div>
           </div>
 
-          {/* Host Exclusive Difficulty Dropdown OR Non-Host Read-Only Display */}
-          <div className="w-full lg:w-80 space-y-1.5 sm:space-y-2">
-            <div className="flex items-center justify-between text-xs">
-              <span className="text-slate-400 font-medium flex items-center gap-1.5">
-                <SlidersHorizontal className="w-3.5 h-3.5 text-amber-400" />
-                <span>Difficulty Level</span>
-              </span>
-              <span className="font-mono text-slate-400">
-                {DIFFICULTY_CONFIG[room.difficulty].emptyCells} Empty Cells
-              </span>
-            </div>
-
-            {isHost ? (
-              <div className="relative">
-                <select
-                  aria-label="Select match difficulty level"
-                  value={room.difficulty}
-                  onChange={(e) => onSetDifficulty(e.target.value as DifficultyLevel)}
-                  className="w-full px-3.5 sm:px-4 py-2.5 sm:py-3 bg-[#0B0F17] border border-amber-500/40 hover:border-amber-400 rounded-xl text-base sm:text-sm font-semibold text-slate-100 focus:outline-none focus:border-amber-400 transition-colors cursor-pointer"
-                >
-                  {DIFFICULTY_LEVELS.map((level) => (
-                    <option key={level} value={level} className="bg-[#0B0F17] text-slate-100">
-                      {level} — {DIFFICULTY_CONFIG[level].clues} Clues ({DIFFICULTY_CONFIG[level].emptyCells} Empty)
-                    </option>
-                  ))}
-                </select>
-              </div>
-            ) : (
-              <div className="px-4 py-2.5 sm:py-3 bg-[#0B0F17] border border-slate-800 rounded-xl flex items-center justify-between">
-                <span className="text-sm font-semibold text-slate-100">{room.difficulty}</span>
-                <span className="text-xs text-slate-400 font-mono">
-                  {DIFFICULTY_CONFIG[room.difficulty].clues} Clues · Host Controlled
+          {/* Lobby Settings: Difficulty Level & Mistake Limit */}
+          <div className="w-full lg:w-auto flex flex-col sm:flex-row items-stretch sm:items-center gap-4">
+            {/* 1. Difficulty Level Selector */}
+            <div className="w-full sm:w-64 space-y-1.5">
+              <div className="flex items-center justify-between text-xs">
+                <span className="text-slate-400 font-medium flex items-center gap-1.5">
+                  <SlidersHorizontal className="w-3.5 h-3.5 text-amber-400" />
+                  <span>Difficulty</span>
+                </span>
+                <span className="font-mono text-slate-400 text-[11px]">
+                  {room.difficulty === 'Custom'
+                    ? `${81 - (room.customClues || 40)} Empty`
+                    : `${DIFFICULTY_CONFIG[room.difficulty].emptyCells} Empty`}
                 </span>
               </div>
+
+              {isHost ? (
+                <div className="space-y-2">
+                  <div className="relative">
+                    <select
+                      aria-label="Select match difficulty level"
+                      value={room.difficulty}
+                      onChange={(e) => {
+                        const newDiff = e.target.value as DifficultyLevel;
+                        onSetDifficulty(newDiff, newDiff === 'Custom' ? room.customClues || 40 : undefined);
+                      }}
+                      className="w-full px-3 py-2 bg-[#0B0F17] border border-amber-500/40 hover:border-amber-400 rounded-xl text-xs font-semibold text-slate-100 focus:outline-none focus:border-amber-400 transition-colors cursor-pointer"
+                    >
+                      {DIFFICULTY_LEVELS.map((level) => (
+                        <option key={level} value={level} className="bg-[#0B0F17] text-slate-100">
+                          {level === 'Custom'
+                            ? `Custom (${room.customClues || 40} Clues)`
+                            : `${level} (${DIFFICULTY_CONFIG[level].clues} Clues)`}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+
+                  {room.difficulty === 'Custom' && (
+                    <div className="p-2.5 rounded-xl bg-[#0B0F17] border border-amber-500/30 space-y-1.5 animate-in fade-in duration-150">
+                      <div className="flex items-center justify-between text-[11px]">
+                        <span className="text-amber-300 font-semibold">Custom Clues:</span>
+                        <span className="font-mono font-bold text-amber-400 bg-amber-500/10 px-1.5 py-0.5 rounded border border-amber-500/30">
+                          {room.customClues || 40} Clues
+                        </span>
+                      </div>
+                      <input
+                        type="range"
+                        min={17}
+                        max={65}
+                        value={room.customClues || 40}
+                        onChange={(e) => onSetDifficulty('Custom', Number(e.target.value))}
+                        className="w-full accent-amber-500 cursor-pointer h-1.5 bg-slate-800 rounded-lg"
+                      />
+                      <div className="flex justify-between text-[10px] font-mono text-slate-400">
+                        <span>17 (Extreme)</span>
+                        <span>65 (Casual)</span>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              ) : (
+                <div className="px-3 py-2 bg-[#0B0F17] border border-slate-800 rounded-xl flex items-center justify-between">
+                  <span className="text-xs font-semibold text-slate-100">{room.difficulty}</span>
+                  <span className="text-[11px] text-slate-400 font-mono">
+                    {room.difficulty === 'Custom'
+                      ? `${room.customClues || 40} Clues`
+                      : `${DIFFICULTY_CONFIG[room.difficulty].clues} Clues`}
+                  </span>
+                </div>
+              )}
+            </div>
+
+            {/* 2. Mistake Limit Selector (Hidden in Exam Mode) */}
+            {room.feedbackMode !== 'delayed' ? (
+              <div className="w-full sm:w-64 space-y-1.5">
+                <div className="flex items-center justify-between text-xs">
+                  <span className="text-slate-400 font-medium flex items-center gap-1.5">
+                    <ShieldAlert className="w-3.5 h-3.5 text-rose-400" />
+                    <span>Mistake Limit</span>
+                  </span>
+                  <span className="font-mono text-[11px] text-rose-400/90 font-medium">
+                    {currentMistakeLimit === 0 ? 'No Cap' : `Max ${currentMistakeLimit}`}
+                  </span>
+                </div>
+
+                {isHost ? (
+                  <div className="relative">
+                    <select
+                      aria-label="Configure match mistake limit"
+                      value={currentMistakeLimit}
+                      onChange={(e) => onSetMistakeLimit?.(Number(e.target.value))}
+                      className="w-full px-3 py-2 bg-[#0B0F17] border border-rose-500/40 hover:border-rose-400 rounded-xl text-xs font-semibold text-slate-100 focus:outline-none focus:border-rose-400 transition-colors cursor-pointer"
+                    >
+                      <option value={0} className="bg-[#0B0F17] text-slate-100">
+                        No Limit (Unlimited Mistakes)
+                      </option>
+                      <option value={1} className="bg-[#0B0F17] text-slate-100">
+                        1 Mistake (Sudden Death)
+                      </option>
+                      <option value={3} className="bg-[#0B0F17] text-slate-100">
+                        3 Mistakes (Tournament Standard)
+                      </option>
+                      <option value={5} className="bg-[#0B0F17] text-slate-100">
+                        5 Mistakes (Casual Mode)
+                      </option>
+                      <option value={10} className="bg-[#0B0F17] text-slate-100">
+                        10 Mistakes (Practice Mode)
+                      </option>
+                    </select>
+                  </div>
+                ) : (
+                  <div className="px-3 py-2 bg-[#0B0F17] border border-slate-800 rounded-xl flex items-center justify-between">
+                    <span className="text-xs font-semibold text-rose-300">
+                      {currentMistakeLimit === 0 ? 'Unlimited Moves' : `${currentMistakeLimit} Mistakes Allowed`}
+                    </span>
+                    <span className="text-[11px] text-slate-400 font-mono">
+                      Host Controlled
+                    </span>
+                  </div>
+                )}
+              </div>
+            ) : (
+              <div className="w-full sm:w-64 space-y-1.5">
+                <div className="flex items-center justify-between text-xs">
+                  <span className="text-indigo-400 font-medium flex items-center gap-1.5">
+                    <ShieldAlert className="w-3.5 h-3.5 text-indigo-400" />
+                    <span>Mod: Sınav Modu</span>
+                  </span>
+                </div>
+                <div className="px-3 py-2 bg-[#0B0F17] border border-indigo-500/40 rounded-xl text-xs font-semibold text-indigo-200">
+                  Hata Sayımı Yok (Sınav Formatı)
+                </div>
+              </div>
             )}
-            <p className="text-[11px] sm:text-xs text-slate-400 leading-relaxed">
-              {DIFFICULTY_CONFIG[room.difficulty].description}
-            </p>
           </div>
         </div>
       </div>
@@ -196,7 +299,7 @@ export const LobbyScreen: React.FC<LobbyScreenProps> = ({
                 <span>My Profile</span>
               </button>
 
-              {isHost && room.players.length < room.maxPlayers && (
+              {isHost && (
                 <button
                   type="button"
                   onClick={onAddBot}

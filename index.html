@@ -3,6 +3,96 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+    <script>
+      (function() {
+        // AI Studio Dev Environment: HMR WebSocket is disabled and not proxied.
+        // Intercept Vite HMR client connection attempts while preserving standard WebSockets (like Socket.IO).
+        var OrigWebSocket = window.WebSocket;
+        if (OrigWebSocket) {
+          function ViteHmrStub(url, protocols) {
+            var isHmr = (
+              (typeof protocols === 'string' && protocols.indexOf('vite-hmr') !== -1) ||
+              (Array.isArray(protocols) && protocols.indexOf('vite-hmr') !== -1) ||
+              (typeof url === 'string' && url.indexOf('socket.io') === -1 && protocols === 'vite-hmr')
+            );
+
+            if (isHmr) {
+              var target = new EventTarget();
+              target.readyState = 1; // WebSocket.OPEN
+              target.binaryType = 'blob';
+              target.bufferedAmount = 0;
+              target.extensions = '';
+              target.protocol = 'vite-hmr';
+              target.url = String(url);
+              target.send = function() {};
+              target.close = function() {
+                target.readyState = 3;
+                try {
+                  target.dispatchEvent(new CloseEvent('close', { wasClean: true, code: 1000 }));
+                } catch (err) {
+                  var ev = new Event('close');
+                  ev.wasClean = true;
+                  target.dispatchEvent(ev);
+                }
+              };
+
+              // Dispatch open event on next tick so @vite/client sets hasOpened = true and never throws
+              setTimeout(function() {
+                if (target.readyState === 1) {
+                  target.dispatchEvent(new Event('open'));
+                }
+              }, 0);
+
+              return target;
+            }
+
+            return new OrigWebSocket(url, protocols);
+          }
+
+          ViteHmrStub.prototype = OrigWebSocket.prototype;
+          ViteHmrStub.CONNECTING = 0;
+          ViteHmrStub.OPEN = 1;
+          ViteHmrStub.CLOSING = 2;
+          ViteHmrStub.CLOSED = 3;
+
+          window.WebSocket = ViteHmrStub;
+        }
+
+        // Suppress benign Vite HMR disconnect noise in console and window
+        var origConsoleError = console.error;
+        console.error = function() {
+          var args = Array.prototype.slice.call(arguments);
+          var text = args.map(function(a) { return (a && a.message) || String(a); }).join(' ');
+          if (text.indexOf('WebSocket') !== -1) {
+            return;
+          }
+          origConsoleError.apply(console, args);
+        };
+
+        window.onerror = function(msg, url, lineNo, columnNo, error) {
+          var str = (msg || '') + ' ' + (error && error.message ? error.message : '');
+          if (str.indexOf('WebSocket') !== -1) {
+            return true;
+          }
+        };
+
+        window.addEventListener('error', function(e) {
+          var str = (e && e.message ? e.message : '') + ' ' + (e && e.error && e.error.message ? e.error.message : '');
+          if (str.indexOf('WebSocket') !== -1) {
+            e.stopImmediatePropagation && e.stopImmediatePropagation();
+            e.preventDefault && e.preventDefault();
+          }
+        }, true);
+
+        window.addEventListener('unhandledrejection', function(e) {
+          var str = (e && e.reason && e.reason.message ? e.reason.message : '') + ' ' + String(e && e.reason);
+          if (str.indexOf('WebSocket') !== -1) {
+            e.stopImmediatePropagation && e.stopImmediatePropagation();
+            e.preventDefault && e.preventDefault();
+          }
+        }, true);
+      })();
+    </script>
     <title>Nueve: Competitive Multiplayer Sudoku</title>
     <meta name="description" content="Real-time multiplayer competitive Sudoku arena with unique backtracking board generation, 6 difficulty tiers, and live rank-interpolated scoring." />
     <meta property="og:title" content="Nueve: Competitive Multiplayer Sudoku" />

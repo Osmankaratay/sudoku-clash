@@ -27,10 +27,39 @@ import {
   AlertCircle,
   CheckCircle2,
   Shield,
+  Palette,
+  Clock,
+  History,
+  Swords,
+  Settings,
+  Sliders,
+  RotateCcw,
+  Brain,
+  ShieldAlert,
+  Zap,
+  SlidersHorizontal,
+  Volume2,
+  VolumeX,
 } from 'lucide-react';
 import { AVATAR_OPTIONS, getAvatarById } from '../utils/avatars.ts';
 import { AvatarBadge } from './AvatarBadge.tsx';
-import { UserAccount, FriendUser } from '../types/game.ts';
+import {
+  UserAccount,
+  FriendUser,
+  MatchHistoryRecord,
+  ActivePlayerSummary,
+  DifficultyLevel,
+  DIFFICULTY_CONFIG,
+} from '../types/game.ts';
+import { BOARD_THEME_LIST, BoardThemeId, getBoardTheme } from '../utils/boardThemes.ts';
+import { triggerHaptic, soundEngine } from '../utils/sound.ts';
+import {
+  UserGamePreferences,
+  DEFAULT_GAME_PREFERENCES,
+  loadGamePreferences,
+  saveGamePreferences,
+} from '../utils/gamePreferences.ts';
+import { calculateDifficultyMultiplier } from '../sudokuEngine.ts';
 import { Socket } from 'socket.io-client';
 
 interface ProfileModalProps {
@@ -39,6 +68,8 @@ interface ProfileModalProps {
   currentUser: UserAccount | null;
   authToken?: string | null;
   currentRoomCode?: string | null;
+  currentThemeId?: string;
+  onSelectTheme?: (themeId: BoardThemeId) => void;
   onSave: (username: string, avatarId: string) => void;
   onLogout?: () => void;
   onOpenAuth?: () => void;
@@ -48,6 +79,7 @@ interface ProfileModalProps {
   onJoinRoomCode?: (code: string) => void;
   onUserUpdated?: (user: UserAccount) => void;
   socket?: Socket | null;
+  onOpenSettings?: () => void;
 }
 
 export const ProfileModal: React.FC<ProfileModalProps> = ({
@@ -56,6 +88,8 @@ export const ProfileModal: React.FC<ProfileModalProps> = ({
   currentUser,
   authToken,
   currentRoomCode,
+  currentThemeId,
+  onSelectTheme,
   onSave,
   onLogout,
   onOpenAuth,
@@ -65,10 +99,29 @@ export const ProfileModal: React.FC<ProfileModalProps> = ({
   onJoinRoomCode,
   onUserUpdated,
   socket,
+  onOpenSettings,
 }) => {
-  const [activeTab, setActiveTab] = useState<'profile' | 'matches' | 'security' | 'friends'>('profile');
+  const [activeTab, setActiveTab] = useState<'profile' | 'settings' | 'matches' | 'security' | 'friends'>('profile');
   const [name, setName] = useState(currentUsername);
   const [selectedAvatarId, setSelectedAvatarId] = useState(currentAvatarId);
+  const [selectedThemeId, setSelectedThemeId] = useState<BoardThemeId>(() => {
+    if (currentThemeId && (currentThemeId === 'midnight' || currentThemeId === 'sunset' || currentThemeId === 'emerald' || currentThemeId === 'cyberpunk' || currentThemeId === 'coffee')) {
+      return currentThemeId as BoardThemeId;
+    }
+    if (typeof window !== 'undefined') {
+      const saved = localStorage.getItem('nueve_board_theme') as BoardThemeId | null;
+      if (saved && (saved === 'midnight' || saved === 'sunset' || saved === 'emerald' || saved === 'cyberpunk' || saved === 'coffee')) {
+        return saved;
+      }
+    }
+    return 'midnight';
+  });
+
+  useEffect(() => {
+    if (currentThemeId && (currentThemeId === 'midnight' || currentThemeId === 'sunset' || currentThemeId === 'emerald' || currentThemeId === 'cyberpunk' || currentThemeId === 'coffee')) {
+      setSelectedThemeId(currentThemeId as BoardThemeId);
+    }
+  }, [currentThemeId]);
 
   // Security & Account state
   const [currentPassword, setCurrentPassword] = useState('');
@@ -189,6 +242,85 @@ export const ProfileModal: React.FC<ProfileModalProps> = ({
     text: string;
   } | null>(null);
   const [invitedUserIds, setInvitedUserIds] = useState<Record<string, boolean>>({});
+
+  // Active Players List from server
+  const [activePlayers, setActivePlayers] = useState<ActivePlayerSummary[]>([]);
+  const [loadingActivePlayers, setLoadingActivePlayers] = useState<boolean>(false);
+
+  // User Game Preferences State (Defaults)
+  const [gamePrefs, setGamePrefs] = useState<UserGamePreferences>(() => loadGamePreferences());
+  const [prefsSavedToast, setPrefsSavedToast] = useState<boolean>(false);
+
+  const fetchActivePlayers = async () => {
+    setLoadingActivePlayers(true);
+    try {
+      const res = await fetch('/api/players/active');
+      const data = await res.json();
+      if (data.ok && Array.isArray(data.players)) {
+        setActivePlayers(data.players);
+      }
+    } catch (err) {
+      console.error('Failed to fetch active players:', err);
+    } finally {
+      setLoadingActivePlayers(false);
+    }
+  };
+
+  useEffect(() => {
+    fetchActivePlayers();
+    const interval = setInterval(fetchActivePlayers, 8000);
+    return () => clearInterval(interval);
+  }, []);
+
+  useEffect(() => {
+    if (!socket) return;
+    socket.emit('players:get_active', (res: { ok: boolean; players: ActivePlayerSummary[] }) => {
+      if (res?.ok && Array.isArray(res.players)) {
+        setActivePlayers(res.players);
+      }
+    });
+  }, [socket]);
+
+  const isFriendInActiveList = (friend: FriendUser) => {
+    if (friend.online) return true;
+    return activePlayers.some(
+      (ap) =>
+        (ap.userId && ap.userId === friend.id) ||
+        ap.id === friend.id ||
+        (ap.username && ap.username.toLowerCase() === friend.username.toLowerCase())
+    );
+  };
+
+  const handleUpdatePreference = <K extends keyof UserGamePreferences>(
+    key: K,
+    value: UserGamePreferences[K]
+  ) => {
+    setGamePrefs((prev) => {
+      const updated = { ...prev, [key]: value };
+      saveGamePreferences(updated);
+      if (key === 'defaultTheme' && onSelectTheme) {
+        onSelectTheme(value as BoardThemeId);
+        setSelectedThemeId(value as BoardThemeId);
+      }
+      return updated;
+    });
+    setPrefsSavedToast(true);
+    triggerHaptic(15);
+    setTimeout(() => setPrefsSavedToast(false), 2000);
+  };
+
+  const handleResetPreferences = () => {
+    const copy = { ...DEFAULT_GAME_PREFERENCES };
+    setGamePrefs(copy);
+    saveGamePreferences(copy);
+    if (onSelectTheme) {
+      onSelectTheme(copy.defaultTheme);
+      setSelectedThemeId(copy.defaultTheme);
+    }
+    soundEngine.playSelect();
+    setPrefsSavedToast(true);
+    setTimeout(() => setPrefsSavedToast(false), 2500);
+  };
 
   const selectedAvatar = getAvatarById(selectedAvatarId);
 
@@ -378,20 +510,30 @@ export const ProfileModal: React.FC<ProfileModalProps> = ({
               <Sparkles className="w-3.5 h-3.5" />
               <span>Profile</span>
             </button>
-            {currentUser && (
-              <button
-                type="button"
-                onClick={() => setActiveTab('matches')}
-                className={`flex-1 min-h-[40px] py-2 px-2.5 rounded-lg flex items-center justify-center gap-1.5 transition-all whitespace-nowrap cursor-pointer ${
-                  activeTab === 'matches'
-                    ? 'bg-amber-500 text-slate-950 font-bold shadow-sm'
-                    : 'text-slate-400 hover:text-slate-200'
-                }`}
-              >
-                <Trophy className="w-3.5 h-3.5" />
-                <span>Recent</span>
-              </button>
-            )}
+            <button
+              type="button"
+              onClick={() => setActiveTab('settings')}
+              className={`flex-1 min-h-[40px] py-2 px-2.5 rounded-lg flex items-center justify-center gap-1.5 transition-all whitespace-nowrap cursor-pointer ${
+                activeTab === 'settings'
+                  ? 'bg-amber-500 text-slate-950 font-bold shadow-sm'
+                  : 'text-slate-400 hover:text-slate-200'
+              }`}
+            >
+              <Settings className="w-3.5 h-3.5" />
+              <span>Ayarlar</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => setActiveTab('matches')}
+              className={`flex-1 min-h-[40px] py-2 px-2.5 rounded-lg flex items-center justify-center gap-1.5 transition-all whitespace-nowrap cursor-pointer ${
+                activeTab === 'matches'
+                  ? 'bg-amber-500 text-slate-950 font-bold shadow-sm'
+                  : 'text-slate-400 hover:text-slate-200'
+              }`}
+            >
+              <History className="w-3.5 h-3.5" />
+              <span>Match History</span>
+            </button>
             {currentUser && (
               <button
                 type="button"
@@ -568,6 +710,103 @@ export const ProfileModal: React.FC<ProfileModalProps> = ({
                 </div>
               </div>
 
+              {/* Sudoku Board Color Palette Theme Picker */}
+              <div className="space-y-2.5 pt-3 border-t border-slate-800">
+                <div className="flex items-center justify-between text-xs">
+                  <span className="font-semibold text-slate-200 flex items-center gap-1.5">
+                    <Palette className="w-3.5 h-3.5 text-amber-400" />
+                    <span>Sudoku Board Color Palette</span>
+                  </span>
+                  <span className="text-[11px] font-mono text-slate-400">
+                    {BOARD_THEME_LIST.length} palettes
+                  </span>
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                  {BOARD_THEME_LIST.map((theme) => {
+                    const isSelected = theme.id === selectedThemeId;
+                    return (
+                      <button
+                        key={theme.id}
+                        type="button"
+                        onClick={() => {
+                          setSelectedThemeId(theme.id);
+                          localStorage.setItem('nueve_board_theme', theme.id);
+                          triggerHaptic(15);
+                          if (onSelectTheme) {
+                            onSelectTheme(theme.id);
+                          }
+                        }}
+                        className={`p-2.5 rounded-xl border text-left flex items-start gap-2.5 transition-all cursor-pointer ${
+                          isSelected
+                            ? 'bg-amber-500/15 border-amber-400 ring-2 ring-amber-400/30'
+                            : 'bg-[#0B0F17] hover:bg-slate-800/80 border-slate-800'
+                        }`}
+                      >
+                        {/* Mini 4-cell Preview */}
+                        <div
+                          className="w-10 h-10 rounded-lg p-0.5 grid grid-cols-2 grid-rows-2 gap-0.5 shrink-0 border"
+                          style={{
+                            backgroundColor: theme.preview.bg,
+                            borderColor: theme.preview.border,
+                          }}
+                        >
+                          <div
+                            className="rounded-xs flex items-center justify-center font-mono font-bold text-[9px]"
+                            style={{
+                              backgroundColor: theme.preview.cell,
+                              color: '#ffffff',
+                            }}
+                          >
+                            5
+                          </div>
+                          <div
+                            className="rounded-xs flex items-center justify-center font-mono font-black text-[9px] border"
+                            style={{
+                              backgroundColor: theme.preview.accent + '33',
+                              color: theme.preview.highlight,
+                              borderColor: theme.preview.accent,
+                            }}
+                          >
+                            9
+                          </div>
+                          <div
+                            className="rounded-xs flex items-center justify-center font-mono text-[8px]"
+                            style={{
+                              backgroundColor: theme.preview.cell,
+                              color: theme.preview.accent,
+                            }}
+                          >
+                            3
+                          </div>
+                          <div
+                            className="rounded-xs flex items-center justify-center"
+                            style={{ backgroundColor: theme.preview.cell }}
+                          />
+                        </div>
+
+                        <div className="min-w-0 flex-1">
+                          <div className="flex items-center justify-between">
+                            <span className="text-xs font-bold text-slate-100 flex items-center gap-1.5">
+                              <span>{theme.name}</span>
+                              {isSelected && (
+                                <span className="text-[10px] text-amber-400 font-mono flex items-center gap-0.5">
+                                  <Check className="w-3 h-3" />
+                                  <span>Active</span>
+                                </span>
+                              )}
+                            </span>
+                          </div>
+                          <p className="text-[10px] text-slate-400 leading-snug line-clamp-1 mt-0.5">
+                            {theme.tagline}
+                          </p>
+                        </div>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+
               {/* Actions */}
               <div className="flex items-center justify-between pt-2 border-t border-slate-800">
                 {currentUser && onLogout ? (
@@ -618,28 +857,50 @@ export const ProfileModal: React.FC<ProfileModalProps> = ({
           </div>
         )}
 
-        {/* TAB: RECENT MATCHES (LAST 10 COMPLETED MATCHES) */}
-        {activeTab === 'matches' && currentUser && (
+        {/* TAB: MATCH HISTORY (LAST 10 COMPLETED MATCHES) */}
+        {activeTab === 'matches' && (
           <div className="space-y-4 animate-in fade-in duration-150">
             {/* Header info */}
             <div className="flex items-center justify-between">
               <div>
                 <h3 className="text-xs font-bold text-slate-200 flex items-center gap-1.5">
-                  <Trophy className="w-3.5 h-3.5 text-amber-400" />
-                  <span>Recent Matches Record</span>
+                  <History className="w-3.5 h-3.5 text-amber-400" />
+                  <span>Match History</span>
                 </h3>
                 <p className="text-[11px] text-slate-400 mt-0.5">
-                  Outcome, completion date, and final rank for your last 10 tournament games.
+                  Your last 10 completed tournament and solo matches, including win/loss status and duration.
                 </p>
               </div>
-              <span className="text-[10px] font-mono px-2 py-0.5 rounded-full bg-slate-800 text-slate-300">
-                {(currentUser.stats.recentMatches || []).length} Recorded
-              </span>
             </div>
 
             {/* List of last 10 completed matches */}
             {(() => {
-              const matches = (currentUser.stats.recentMatches || []).slice(0, 10);
+              const localMatches: MatchHistoryRecord[] = (() => {
+                if (typeof window === 'undefined') return [];
+                try {
+                  const raw = localStorage.getItem('nueve_match_history');
+                  return raw ? JSON.parse(raw) : [];
+                } catch {
+                  return [];
+                }
+              })();
+
+              const combinedMap = new Map<string, MatchHistoryRecord>();
+              // User account matches
+              (currentUser?.stats?.recentMatches || []).forEach((m) => {
+                combinedMap.set(m.id || String(m.timestamp), m);
+              });
+              // Local matches
+              localMatches.forEach((m) => {
+                const key = m.id || String(m.timestamp);
+                if (!combinedMap.has(key)) {
+                  combinedMap.set(key, m);
+                }
+              });
+
+              const matches = Array.from(combinedMap.values())
+                .sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0))
+                .slice(0, 10);
 
               if (matches.length === 0) {
                 return (
@@ -650,7 +911,7 @@ export const ProfileModal: React.FC<ProfileModalProps> = ({
                     <div>
                       <h4 className="text-sm font-semibold text-slate-200">No Matches Completed Yet</h4>
                       <p className="text-xs text-slate-400 max-w-xs mx-auto mt-1">
-                        Complete your first competitive Sudoku match in a private room or lobby to record official standings and ranks here.
+                        Complete your first competitive Sudoku match in multiplayer or solo mode to track your official win/loss record and durations here.
                       </p>
                     </div>
                   </div>
@@ -660,8 +921,7 @@ export const ProfileModal: React.FC<ProfileModalProps> = ({
               return (
                 <div className="space-y-2.5 max-h-[380px] overflow-y-auto pr-1">
                   {matches.map((match, idx) => {
-                    const isWin = match.rank === 1;
-                    const isPodium = match.rank <= 3;
+                    const isWin = match.outcome === 'win' || match.rank === 1;
                     const formattedDate = new Date(match.timestamp).toLocaleDateString(undefined, {
                       month: 'short',
                       day: 'numeric',
@@ -681,72 +941,82 @@ export const ProfileModal: React.FC<ProfileModalProps> = ({
                         key={match.id || idx}
                         className={`p-3.5 rounded-xl border flex items-center justify-between gap-3 transition-colors ${
                           isWin
-                            ? 'bg-amber-500/10 border-amber-500/40 hover:border-amber-400/60'
-                            : isPodium
-                            ? 'bg-[#131B2E] border-slate-750 hover:border-slate-700'
+                            ? 'bg-emerald-950/25 border-emerald-500/35 hover:border-emerald-400/50'
                             : 'bg-[#0B0F17] border-slate-800 hover:border-slate-750'
                         }`}
                       >
-                        {/* Left: Final Rank Badge & Outcome */}
+                        {/* Left: Win/Loss status & details */}
                         <div className="flex items-center gap-3 min-w-0">
-                          {/* Final Rank Badge */}
+                          {/* Outcome Status Pill */}
                           <div
-                            className={`w-11 h-11 rounded-xl flex flex-col items-center justify-center font-mono font-bold shrink-0 border ${
+                            className={`w-12 h-12 rounded-xl flex flex-col items-center justify-center font-mono font-bold shrink-0 border ${
                               isWin
-                                ? 'bg-amber-500 text-slate-950 border-amber-300 shadow-md shadow-amber-500/30'
-                                : match.rank === 2
-                                ? 'bg-slate-300 text-slate-950 border-white'
-                                : match.rank === 3
-                                ? 'bg-amber-700/80 text-amber-100 border-amber-600'
-                                : 'bg-[#0B0F17] text-slate-300 border-slate-800'
+                                ? 'bg-emerald-500/20 text-emerald-300 border-emerald-400/50 shadow-sm'
+                                : 'bg-rose-950/40 text-rose-300 border-rose-500/40'
                             }`}
                           >
-                            <span className="text-[9px] uppercase font-semibold leading-none">Rank</span>
-                            <span className="text-base font-extrabold leading-none mt-0.5">#{match.rank}</span>
+                            <span className="text-[10px] uppercase font-black tracking-wider leading-none">
+                              {isWin ? 'WIN' : 'LOSS'}
+                            </span>
+                            <span className="text-xs font-bold leading-none mt-1">
+                              {match.eliminated ? 'KO' : `#${match.rank || (isWin ? 1 : 2)}`}
+                            </span>
                           </div>
 
-                          {/* Outcome & Details */}
-                          <div className="min-w-0">
+                          {/* Outcome Details & Duration */}
+                          <div className="min-w-0 space-y-1">
                             <div className="flex items-center gap-2 flex-wrap">
                               <span
                                 className={`text-xs font-bold leading-tight ${
-                                  isWin
-                                    ? 'text-amber-300'
-                                    : match.rank === 2
-                                    ? 'text-slate-100'
-                                    : match.rank === 3
-                                    ? 'text-amber-200'
-                                    : 'text-slate-300'
+                                  isWin ? 'text-emerald-300' : 'text-slate-200'
                                 }`}
                               >
                                 {isWin
-                                  ? '1st Place Victory'
-                                  : match.rank === 2
-                                  ? '2nd Place (Silver)'
-                                  : match.rank === 3
-                                  ? '3rd Place (Bronze)'
-                                  : `Completed #${match.rank}`}
+                                  ? 'Victory (1st Place)'
+                                  : match.eliminated
+                                  ? 'Defeat · Mistake Limit'
+                                  : `Defeat (Rank #${match.rank || 2})`}
                               </span>
 
-                              <span className="px-1.5 py-0.2 rounded text-[10px] font-mono font-bold bg-amber-500/20 text-amber-300 border border-amber-500/40">
+                              <span className="px-1.5 py-0.5 rounded text-[10px] font-mono font-bold bg-amber-500/15 text-amber-300 border border-amber-500/30">
                                 {match.score} pts
                               </span>
-                            </div>
 
-                            <div className="flex items-center gap-2 text-[11px] text-slate-400 mt-1 font-mono flex-wrap">
-                              <span className="px-1.5 py-0.2 rounded bg-slate-800/80 text-slate-300 text-[10px]">
+                              <span className="px-1.5 py-0.5 rounded text-[10px] font-mono bg-slate-800 text-slate-300">
                                 {match.difficulty || 'Medium'}
                               </span>
+
+                              {match.maxCombo && match.maxCombo > 1 && (
+                                <span className="px-1.5 py-0.5 rounded text-[10px] font-mono font-bold bg-orange-500/15 text-orange-300 border border-orange-500/30 flex items-center gap-0.5">
+                                  🔥 {match.maxCombo}x combo
+                                </span>
+                              )}
+
+                              {(match.difficultyMultiplier || match.timeMultiplier) && (
+                                <span className="px-1.5 py-0.5 rounded text-[10px] font-mono bg-amber-500/15 text-amber-300 border border-amber-500/30" title="Zorluk Çarpanı">
+                                  🎯 {(match.difficultyMultiplier || match.timeMultiplier || 1).toFixed(2)}x
+                                </span>
+                              )}
+                            </div>
+
+                            <div className="flex items-center gap-2.5 text-[11px] text-slate-400 font-mono flex-wrap">
+                              {/* Duration with clock icon */}
+                              <span className="flex items-center gap-1 text-slate-300 font-semibold">
+                                <Clock className="w-3 h-3 text-amber-400 shrink-0" />
+                                <span>Duration: {formattedTime}</span>
+                              </span>
                               <span>·</span>
-                              <span>⏱ {formattedTime}</span>
                               {match.mistakes !== undefined && (
+                                <span className={match.mistakes > 0 ? 'text-rose-400' : 'text-emerald-400 font-bold'}>
+                                  {match.mistakes === 0 ? 'Flawless (No Cap)' : `${match.mistakes} error${match.mistakes === 1 ? '' : 's'}`}
+                                </span>
+                              )}
+                              {match.hintsUsed && match.hintsUsed > 0 ? (
                                 <>
                                   <span>·</span>
-                                  <span className={match.mistakes > 0 ? 'text-rose-400' : 'text-slate-400'}>
-                                    {match.mistakes} error{match.mistakes === 1 ? '' : 's'}
-                                  </span>
+                                  <span className="text-amber-400">💡 {match.hintsUsed} hint{match.hintsUsed === 1 ? '' : 's'}</span>
                                 </>
-                              )}
+                              ) : null}
                             </div>
                           </div>
                         </div>
@@ -1134,10 +1404,41 @@ export const ProfileModal: React.FC<ProfileModalProps> = ({
                             </div>
 
                             <div className="min-w-0">
-                              <div className="flex items-center gap-1.5">
+                              <div className="flex items-center gap-2 flex-wrap">
                                 <span className="font-semibold text-sm text-slate-100 truncate">
                                   {friend.username}
                                 </span>
+
+                                {/* Challenge Friend button next to username if in active player list */}
+                                {isFriendInActiveList(friend) && (
+                                  <button
+                                    type="button"
+                                    disabled={isInvited || isInMyRoom}
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      handleInvite(friend.id, friend.username);
+                                    }}
+                                    className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[11px] font-bold border transition-all cursor-pointer ${
+                                      isInMyRoom
+                                        ? 'bg-slate-800 text-slate-400 border-slate-700 cursor-default'
+                                        : isInvited
+                                        ? 'bg-emerald-500/20 text-emerald-300 border-emerald-400'
+                                        : 'bg-gradient-to-r from-amber-500/20 to-orange-500/20 hover:from-amber-500/30 hover:to-orange-500/30 text-amber-300 border-amber-500/50 hover:border-amber-400 shadow-xs'
+                                    }`}
+                                    title={
+                                      isInMyRoom
+                                        ? 'Already in your room'
+                                        : isInvited
+                                        ? 'Private invite sent!'
+                                        : `Challenge Friend: Send private room invite to ${friend.username} directly`
+                                    }
+                                  >
+                                    <Swords className="w-3 h-3 text-amber-400" />
+                                    <span>
+                                      {isInvited ? 'Invited!' : isInMyRoom ? 'In Room' : 'Challenge Friend'}
+                                    </span>
+                                  </button>
+                                )}
                               </div>
 
                               <div className="flex items-center gap-2 text-[11px] text-slate-400 mt-0.5">
@@ -1151,6 +1452,10 @@ export const ProfileModal: React.FC<ProfileModalProps> = ({
                                       Online · In Menu
                                     </span>
                                   )
+                                ) : isFriendInActiveList(friend) ? (
+                                  <span className="text-emerald-400 font-medium">
+                                    Active on Server
+                                  </span>
                                 ) : (
                                   <span className="text-slate-500">Offline</span>
                                 )}
@@ -1184,8 +1489,8 @@ export const ProfileModal: React.FC<ProfileModalProps> = ({
                               </button>
                             )}
 
-                            {/* Invite to match / lobby */}
-                            {friend.online && (
+                            {/* Invite / Challenge to match */}
+                            {(friend.online || isFriendInActiveList(friend)) && (
                               <button
                                 type="button"
                                 disabled={isInvited || isInMyRoom}
@@ -1202,7 +1507,7 @@ export const ProfileModal: React.FC<ProfileModalProps> = ({
                                     ? 'Already in your room'
                                     : currentRoomCode
                                     ? `Invite to Room ${currentRoomCode}`
-                                    : 'Create room & invite friend'
+                                    : 'Send private room invite directly'
                                 }
                               >
                                 {isInvited ? (
@@ -1214,8 +1519,8 @@ export const ProfileModal: React.FC<ProfileModalProps> = ({
                                   <span>In Room</span>
                                 ) : (
                                   <>
-                                    <Send className="w-3 h-3" />
-                                    <span>Invite</span>
+                                    <Swords className="w-3 h-3 text-amber-400" />
+                                    <span>Challenge</span>
                                   </>
                                 )}
                               </button>
@@ -1236,6 +1541,115 @@ export const ProfileModal: React.FC<ProfileModalProps> = ({
                     })}
                   </div>
                 )}
+
+                {/* Active Arena Players on Server (Canlı Aktif Oyuncular) */}
+                <div className="pt-3 border-t border-slate-800 space-y-2">
+                  <div className="flex items-center justify-between text-xs font-semibold text-slate-300">
+                    <span className="flex items-center gap-1.5">
+                      <Radio className="w-3.5 h-3.5 text-emerald-400 animate-pulse" />
+                      <span>
+                        Canlı Arenadaki Oyuncular (
+                        {activePlayers.filter((p) => p.username !== currentUsername).length}
+                        )
+                      </span>
+                    </span>
+                    <span className="text-[10px] text-slate-500 font-mono">
+                      Özel Odaya Meydan Oku
+                    </span>
+                  </div>
+
+                  {loadingActivePlayers ? (
+                    <div className="p-3 text-center text-slate-500 text-xs flex items-center justify-center gap-2">
+                      <Loader2 className="w-3.5 h-3.5 animate-spin text-amber-400" />
+                      <span>Aktif oyuncular taranıyor...</span>
+                    </div>
+                  ) : activePlayers.filter((p) => p.username !== currentUsername).length === 0 ? (
+                    <div className="p-3 rounded-xl bg-[#0B0F17]/60 border border-slate-800/60 text-center text-xs text-slate-500">
+                      Şu an arenada başka aktif oyuncu görünmüyor. Bir arkadaşınızı davet edebilirsiniz.
+                    </div>
+                  ) : (
+                    <div className="space-y-1.5 max-h-48 overflow-y-auto pr-1">
+                      {activePlayers
+                        .filter((p) => p.username !== currentUsername)
+                        .map((ap) => {
+                          const isInvited = Boolean(invitedUserIds[ap.userId || ap.id]);
+                          const isInMyRoom = Boolean(
+                            currentRoomCode && ap.currentRoomCode === currentRoomCode
+                          );
+                          const isAlreadyFriend = friends.some(
+                            (f) =>
+                              (ap.userId && f.id === ap.userId) ||
+                              f.username.toLowerCase() === ap.username.toLowerCase()
+                          );
+
+                          return (
+                            <div
+                              key={ap.id}
+                              className="p-2.5 rounded-xl bg-[#0B0F17] border border-slate-800/80 flex items-center justify-between gap-2.5 hover:border-slate-700 transition-colors"
+                            >
+                              <div className="flex items-center gap-2.5 min-w-0">
+                                <div className="relative shrink-0">
+                                  <AvatarBadge avatarId={ap.avatarId} size="sm" />
+                                  <span className="absolute -bottom-0.5 -right-0.5 w-2.5 h-2.5 rounded-full bg-emerald-400 border border-[#0B0F17]" />
+                                </div>
+                                <div className="min-w-0">
+                                  <div className="flex items-center gap-1.5">
+                                    <span className="font-semibold text-xs text-slate-200 truncate">
+                                      {ap.username}
+                                    </span>
+                                    {isAlreadyFriend && (
+                                      <span className="text-[9px] px-1.5 py-0.2 rounded bg-amber-500/15 text-amber-400 border border-amber-500/30">
+                                        Arkadaş
+                                      </span>
+                                    )}
+                                  </div>
+                                  <div className="text-[10px] text-slate-400">
+                                    {ap.currentRoomCode ? (
+                                      <span className="text-amber-400 font-mono">
+                                        Oda #{ap.currentRoomCode}
+                                      </span>
+                                    ) : (
+                                      <span className="text-emerald-400">Menüde · Hazır</span>
+                                    )}
+                                  </div>
+                                </div>
+                              </div>
+
+                              <div className="flex items-center gap-1.5 shrink-0">
+                                <button
+                                  type="button"
+                                  disabled={isInvited || isInMyRoom}
+                                  onClick={() => handleInvite(ap.userId || ap.id, ap.username)}
+                                  className={`px-2.5 py-1 rounded-lg text-xs font-bold flex items-center gap-1 border transition-all cursor-pointer ${
+                                    isInMyRoom
+                                      ? 'bg-slate-800 text-slate-400 border-slate-700 cursor-default'
+                                      : isInvited
+                                      ? 'bg-emerald-500/20 text-emerald-300 border-emerald-400'
+                                      : 'bg-gradient-to-r from-amber-500/20 to-orange-500/20 hover:from-amber-500/30 hover:to-orange-500/30 text-amber-300 border-amber-500/50 hover:border-amber-400 shadow-xs'
+                                  }`}
+                                  title={`Özel odaya meydan oku: ${ap.username}`}
+                                >
+                                  {isInvited ? (
+                                    <>
+                                      <Check className="w-3 h-3 text-emerald-400" />
+                                      <span>Davet Edildi!</span>
+                                    </>
+                                  ) : isInMyRoom ? (
+                                    <span>Odada</span>
+                                  ) : (
+                                    <>
+                                      <Swords className="w-3 h-3 text-amber-400" />
+                                      <span>Meydan Oku</span>
+                                    </>
+                                  )}
+                                </button>
+                              </div>
+                            </div>
+                          );
+                        })}
+                    </div>
+                  )}
+                </div>
               </>
             )}
 
@@ -1247,6 +1661,338 @@ export const ProfileModal: React.FC<ProfileModalProps> = ({
                 className="px-5 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 font-semibold text-xs transition-colors cursor-pointer"
               >
                 Close
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* TAB: SETTINGS & DEFAULTS (Ayarlar) */}
+        {activeTab === 'settings' && (
+          <div className="space-y-4 animate-in fade-in duration-150">
+            {/* Header info with save feedback */}
+            <div className="p-3 rounded-xl bg-[#0B0F17] border border-slate-800 flex items-center justify-between">
+              <div>
+                <h3 className="font-semibold text-sm text-slate-100 flex items-center gap-1.5">
+                  <Settings className="w-4 h-4 text-amber-400" />
+                  <span>Varsayılan Oyun Ayarları & Tercihler</span>
+                </h3>
+                <p className="text-xs text-slate-400">
+                  Oyunların genel halini, zorluklarını, kurallarını ve asistanlarını buradan özelleştirin.
+                </p>
+              </div>
+              {prefsSavedToast && (
+                <span className="text-[11px] font-mono px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 inline-flex items-center gap-1 animate-pulse">
+                  <Check className="w-3 h-3" /> Kaydedildi
+                </span>
+              )}
+            </div>
+
+            {/* Default Difficulty & Custom Clues */}
+            <div className="bg-[#0B0F17] p-3.5 rounded-xl border border-slate-800 space-y-2.5">
+              <div className="flex items-center justify-between text-xs">
+                <span className="font-semibold text-slate-200 flex items-center gap-1">
+                  <Zap className="w-3.5 h-3.5 text-amber-400" />
+                  <span>Varsayılan Zorluk Seviyesi</span>
+                </span>
+                <span className="font-mono text-amber-400 text-[11px]">
+                  Çarpan: {calculateDifficultyMultiplier(
+                    gamePrefs.defaultDifficulty,
+                    gamePrefs.defaultDifficulty === 'Custom' ? gamePrefs.defaultCustomClues : undefined
+                  ).toFixed(2)}x
+                </span>
+              </div>
+
+              <div className="grid grid-cols-2 sm:grid-cols-5 gap-1.5">
+                {(['Easy', 'Medium', 'Hard', 'Expert', 'Custom'] as DifficultyLevel[]).map((level) => {
+                  const active = gamePrefs.defaultDifficulty === level;
+                  const cfg = DIFFICULTY_CONFIG[level];
+                  return (
+                    <button
+                      key={level}
+                      type="button"
+                      onClick={() => handleUpdatePreference('defaultDifficulty', level)}
+                      className={`p-2 rounded-lg border text-xs font-semibold flex flex-col items-center justify-center gap-0.5 transition-all cursor-pointer ${
+                        active
+                          ? 'bg-amber-500 text-slate-950 border-amber-400 font-bold shadow-xs'
+                          : 'bg-[#131B2E] hover:bg-slate-800 border-slate-700/80 text-slate-300'
+                      }`}
+                    >
+                      <span>
+                        {level === 'Easy'
+                          ? 'Kolay'
+                          : level === 'Medium'
+                          ? 'Orta'
+                          : level === 'Hard'
+                          ? 'Zor'
+                          : level === 'Expert'
+                          ? 'Uzman'
+                          : 'Özel'}
+                      </span>
+                      <span className={`text-[10px] font-mono ${active ? 'text-slate-900 font-bold' : 'text-slate-500'}`}>
+                        {level === 'Custom' ? `${gamePrefs.defaultCustomClues} İpucu` : `${cfg.clues} İpucu`}
+                      </span>
+                    </button>
+                  );
+                })}
+              </div>
+
+              {gamePrefs.defaultDifficulty === 'Custom' && (
+                <div className="p-2.5 rounded-lg bg-[#131B2E] border border-amber-500/30 space-y-1.5">
+                  <div className="flex justify-between text-xs">
+                    <span className="text-amber-300 font-semibold">
+                      Özel İpucu Sayısı: {gamePrefs.defaultCustomClues}
+                    </span>
+                    <span className="text-slate-400 font-mono text-[11px]">
+                      {81 - gamePrefs.defaultCustomClues} Boş Hücre
+                    </span>
+                  </div>
+                  <input
+                    type="range"
+                    min={17}
+                    max={65}
+                    step={1}
+                    value={gamePrefs.defaultCustomClues}
+                    onChange={(e) => handleUpdatePreference('defaultCustomClues', Number(e.target.value))}
+                    className="w-full accent-amber-400 cursor-pointer h-1.5 bg-slate-800 rounded-lg"
+                  />
+                </div>
+              )}
+            </div>
+
+            {/* Mistake Limit & Feedback Mode */}
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              {/* Mistake Limit */}
+              <div className="bg-[#0B0F17] p-3.5 rounded-xl border border-slate-800 space-y-2">
+                <span className="font-semibold text-xs text-slate-200 flex items-center gap-1">
+                  <ShieldAlert className="w-3.5 h-3.5 text-rose-400" />
+                  <span>Varsayılan Hata Limiti</span>
+                </span>
+                <div className="grid grid-cols-2 gap-1.5">
+                  {[
+                    { label: '3 Hata', val: 3 },
+                    { label: '1 Hata (Ani Ölüm)', val: 1 },
+                    { label: '5 Hata', val: 5 },
+                    { label: 'Sınırsız', val: 0 },
+                  ].map((opt) => (
+                    <button
+                      key={opt.val}
+                      type="button"
+                      onClick={() => handleUpdatePreference('defaultMistakeLimit', opt.val)}
+                      className={`p-2 rounded-lg border text-xs font-semibold transition-all cursor-pointer text-center ${
+                        gamePrefs.defaultMistakeLimit === opt.val
+                          ? 'bg-rose-500 text-white border-rose-400 font-bold'
+                          : 'bg-[#131B2E] hover:bg-slate-800 border-slate-700/80 text-slate-300'
+                      }`}
+                    >
+                      {opt.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {/* Feedback Mode */}
+              <div className="bg-[#0B0F17] p-3.5 rounded-xl border border-slate-800 space-y-2">
+                <span className="font-semibold text-xs text-slate-200 flex items-center gap-1">
+                  <Brain className="w-3.5 h-3.5 text-sky-400" />
+                  <span>Doğrulama Modu</span>
+                </span>
+                <div className="grid grid-cols-2 gap-1.5">
+                  {[
+                    { label: 'Anında Kontrol', val: 'instant' as const },
+                    { label: 'Gecikmeli / Rekabetçi', val: 'delayed' as const },
+                  ].map((opt) => (
+                    <button
+                      key={opt.val}
+                      type="button"
+                      onClick={() => handleUpdatePreference('defaultFeedbackMode', opt.val)}
+                      className={`p-2 rounded-lg border text-xs font-semibold transition-all cursor-pointer text-center ${
+                        gamePrefs.defaultFeedbackMode === opt.val
+                          ? 'bg-sky-500/20 text-sky-300 border-sky-400 font-bold'
+                          : 'bg-[#131B2E] hover:bg-slate-800 border-slate-700/80 text-slate-300'
+                      }`}
+                    >
+                      {opt.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            </div>
+
+            {/* Board Visuals & Toggles */}
+            <div className="bg-[#0B0F17] p-3.5 rounded-xl border border-slate-800 space-y-3">
+              <span className="font-semibold text-xs text-slate-200 flex items-center gap-1">
+                <Palette className="w-3.5 h-3.5 text-violet-400" />
+                <span>Görünüm, Zen Modu & Taktiksel Çark</span>
+              </span>
+
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                <div className="flex items-center justify-between p-2.5 rounded-lg bg-[#131B2E] border border-slate-800">
+                  <div className="text-xs">
+                    <div className="font-medium text-slate-200">Varsayılan Zen Modu</div>
+                    <div className="text-[10px] text-slate-500">Panelleri gizle, odaklan</div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => handleUpdatePreference('defaultZenMode', !gamePrefs.defaultZenMode)}
+                    className={`w-9 h-5 rounded-full transition-colors relative cursor-pointer ${
+                      gamePrefs.defaultZenMode ? 'bg-emerald-500' : 'bg-slate-700'
+                    }`}
+                  >
+                    <span
+                      className={`block w-4 h-4 rounded-full bg-white transition-transform absolute top-0.5 ${
+                        gamePrefs.defaultZenMode ? 'translate-x-4 left-0.5' : 'left-0.5'
+                      }`}
+                    />
+                  </button>
+                </div>
+
+                <div className="flex items-center justify-between p-2.5 rounded-lg bg-[#131B2E] border border-slate-800">
+                  <div className="text-xs">
+                    <div className="font-medium text-slate-200">Radyal Sayı Çarkı</div>
+                    <div className="text-[10px] text-slate-500">Dairesel hızlı seçim</div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => handleUpdatePreference('radialWheelEnabled', !gamePrefs.radialWheelEnabled)}
+                    className={`w-9 h-5 rounded-full transition-colors relative cursor-pointer ${
+                      gamePrefs.radialWheelEnabled ? 'bg-amber-500' : 'bg-slate-700'
+                    }`}
+                  >
+                    <span
+                      className={`block w-4 h-4 rounded-full bg-white transition-transform absolute top-0.5 ${
+                        gamePrefs.radialWheelEnabled ? 'translate-x-4 left-0.5' : 'left-0.5'
+                      }`}
+                    />
+                  </button>
+                </div>
+
+                <div className="flex items-center justify-between p-2.5 rounded-lg bg-[#131B2E] border border-slate-800">
+                  <div className="text-xs">
+                    <div className="font-medium text-slate-200">Notları Otomatik Sil</div>
+                    <div className="text-[10px] text-slate-500">Adayları temizle</div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => handleUpdatePreference('autoClearNotes', !gamePrefs.autoClearNotes)}
+                    className={`w-9 h-5 rounded-full transition-colors relative cursor-pointer ${
+                      gamePrefs.autoClearNotes ? 'bg-sky-500' : 'bg-slate-700'
+                    }`}
+                  >
+                    <span
+                      className={`block w-4 h-4 rounded-full bg-white transition-transform absolute top-0.5 ${
+                        gamePrefs.autoClearNotes ? 'translate-x-4 left-0.5' : 'left-0.5'
+                      }`}
+                    />
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            {/* Assistance & Audio Toggles */}
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <div className="bg-[#0B0F17] p-3.5 rounded-xl border border-slate-800 space-y-2">
+                <span className="font-semibold text-xs text-slate-200 flex items-center gap-1">
+                  <Eye className="w-3.5 h-3.5 text-sky-400" />
+                  <span>Akıllı Vurgulamalar</span>
+                </span>
+                <div className="space-y-1.5">
+                  <div className="flex items-center justify-between p-2 rounded-lg bg-[#131B2E]">
+                    <span className="text-xs text-slate-300">Çakışan Sayıları Vurgula</span>
+                    <button
+                      type="button"
+                      onClick={() => handleUpdatePreference('highlightConflicts', !gamePrefs.highlightConflicts)}
+                      className={`w-9 h-5 rounded-full transition-colors relative cursor-pointer ${
+                        gamePrefs.highlightConflicts ? 'bg-sky-500' : 'bg-slate-700'
+                      }`}
+                    >
+                      <span
+                        className={`block w-4 h-4 rounded-full bg-white transition-transform absolute top-0.5 ${
+                          gamePrefs.highlightConflicts ? 'translate-x-4 left-0.5' : 'left-0.5'
+                        }`}
+                      />
+                    </button>
+                  </div>
+
+                  <div className="flex items-center justify-between p-2 rounded-lg bg-[#131B2E]">
+                    <span className="text-xs text-slate-300">Eşleşen Rakamları Vurgula</span>
+                    <button
+                      type="button"
+                      onClick={() => handleUpdatePreference('highlightMatchingDigits', !gamePrefs.highlightMatchingDigits)}
+                      className={`w-9 h-5 rounded-full transition-colors relative cursor-pointer ${
+                        gamePrefs.highlightMatchingDigits ? 'bg-sky-500' : 'bg-slate-700'
+                      }`}
+                    >
+                      <span
+                        className={`block w-4 h-4 rounded-full bg-white transition-transform absolute top-0.5 ${
+                          gamePrefs.highlightMatchingDigits ? 'translate-x-4 left-0.5' : 'left-0.5'
+                        }`}
+                      />
+                    </button>
+                  </div>
+                </div>
+              </div>
+
+              <div className="bg-[#0B0F17] p-3.5 rounded-xl border border-slate-800 space-y-2">
+                <span className="font-semibold text-xs text-slate-200 flex items-center gap-1">
+                  <Volume2 className="w-3.5 h-3.5 text-amber-400" />
+                  <span>Ses & Dokunsal Geri Bildirim</span>
+                </span>
+                <div className="space-y-1.5">
+                  <div className="flex items-center justify-between p-2 rounded-lg bg-[#131B2E]">
+                    <span className="text-xs text-slate-300">Ses Efektleri (SFX)</span>
+                    <button
+                      type="button"
+                      onClick={() => handleUpdatePreference('soundEnabled', !gamePrefs.soundEnabled)}
+                      className={`w-9 h-5 rounded-full transition-colors relative cursor-pointer ${
+                        gamePrefs.soundEnabled ? 'bg-amber-500' : 'bg-slate-700'
+                      }`}
+                    >
+                      <span
+                        className={`block w-4 h-4 rounded-full bg-white transition-transform absolute top-0.5 ${
+                          gamePrefs.soundEnabled ? 'translate-x-4 left-0.5' : 'left-0.5'
+                        }`}
+                      />
+                    </button>
+                  </div>
+
+                  <div className="flex items-center justify-between p-2 rounded-lg bg-[#131B2E]">
+                    <span className="text-xs text-slate-300">Dokunsal Titreşim (Haptics)</span>
+                    <button
+                      type="button"
+                      onClick={() => handleUpdatePreference('hapticsEnabled', !gamePrefs.hapticsEnabled)}
+                      className={`w-9 h-5 rounded-full transition-colors relative cursor-pointer ${
+                        gamePrefs.hapticsEnabled ? 'bg-amber-500' : 'bg-slate-700'
+                      }`}
+                    >
+                      <span
+                        className={`block w-4 h-4 rounded-full bg-white transition-transform absolute top-0.5 ${
+                          gamePrefs.hapticsEnabled ? 'translate-x-4 left-0.5' : 'left-0.5'
+                        }`}
+                      />
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            {/* Footer with Reset and Apply */}
+            <div className="flex items-center justify-between pt-3 border-t border-slate-800">
+              <button
+                type="button"
+                onClick={handleResetPreferences}
+                className="px-3.5 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-semibold flex items-center gap-1.5 transition-colors cursor-pointer"
+              >
+                <RotateCcw className="w-3.5 h-3.5" />
+                <span>Varsayılanlara Sıfırla</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={onClose}
+                className="px-5 py-2 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold text-xs flex items-center gap-1.5 transition-colors cursor-pointer"
+              >
+                <Check className="w-3.5 h-3.5" />
+                <span>Kaydet & Kapat</span>
               </button>
             </div>
           </div>

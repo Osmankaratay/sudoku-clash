@@ -1,11 +1,12 @@
-import React, { useState, useEffect, useRef } from 'react';
-import { ChevronLeft, ChevronRight, Check, X, Pencil, Eraser, Sparkles } from 'lucide-react';
-import { soundEngine } from '../utils/sound.ts';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
+import { ChevronLeft, ChevronRight, Eraser } from 'lucide-react';
+import { soundEngine, triggerHaptic } from '../utils/sound.ts';
 
 interface TacticalNumberWheelProps {
   row: number;
   col: number;
   currentValue: number;
+  lastChosenDigit?: number;
   digitCounts: Record<number, number>;
   notesMode: boolean;
   cellNotes: Set<number>;
@@ -15,101 +16,150 @@ interface TacticalNumberWheelProps {
   onClose: () => void;
 }
 
+const SLOT_WIDTH = 42; // Width of each number slot in pixels
+
 export const TacticalNumberWheel: React.FC<TacticalNumberWheelProps> = ({
   row,
   col,
   currentValue,
-  digitCounts,
-  notesMode,
-  cellNotes,
+  lastChosenDigit,
   onSelectDigit,
   onClearCell,
-  onToggleNotesMode,
   onClose,
 }) => {
-  // Center focused number (1-9). If current cell already has a value, start with it, else first candidate or 1.
-  const [focalDigit, setFocalDigit] = useState<number>(() => {
-    if (currentValue >= 1 && currentValue <= 9) return currentValue;
-    if (cellNotes.size > 0) {
-      return Array.from(cellNotes)[0];
-    }
-    // Default to the most needed digit or 1
-    for (let d = 1; d <= 9; d++) {
-      if ((digitCounts[d] || 0) < 9) return d;
-    }
-    return 1;
-  });
+  // Always initialize with the last chosen / selected digit
+  const initialDigit =
+    lastChosenDigit && lastChosenDigit >= 1 && lastChosenDigit <= 9
+      ? lastChosenDigit
+      : currentValue >= 1 && currentValue <= 9
+      ? currentValue
+      : 1;
 
-  const [isNoteActive, setIsNoteActive] = useState<boolean>(notesMode);
+  const [focalDigit, setFocalDigit] = useState<number>(initialDigit);
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const isProgrammaticScrollRef = useRef<boolean>(false);
+  const focalDigitRef = useRef<number>(initialDigit);
+  focalDigitRef.current = focalDigit;
 
-  // Sound and optional vibration when stepping one move
+  // Audio and subtle haptic feedback for wheel interactions
   const triggerStepFeedback = () => {
     soundEngine.playSelect();
-    try {
-      if (typeof navigator !== 'undefined' && 'vibrate' in navigator) {
-        navigator.vibrate(15);
-      }
-    } catch {}
+    triggerHaptic(10);
   };
 
-  // Move numbers ONLY ONE move at a time (-1 move)
+  // Programmatically scroll the swipe container to center a specific digit
+  const scrollToDigit = useCallback((digit: number, smooth = true) => {
+    if (!scrollRef.current) return;
+    const clamped = Math.max(1, Math.min(9, digit));
+    const targetScroll = (clamped - 1) * SLOT_WIDTH;
+    isProgrammaticScrollRef.current = true;
+    scrollRef.current.scrollTo({
+      left: targetScroll,
+      behavior: smooth ? 'smooth' : 'auto',
+    });
+    setFocalDigit(clamped);
+    setTimeout(() => {
+      isProgrammaticScrollRef.current = false;
+    }, smooth ? 250 : 20);
+  }, []);
+
+  // On mount: instantly center the last selected number in the swipe container and fire subtle haptic
+  useEffect(() => {
+    triggerHaptic(12);
+    if (scrollRef.current) {
+      scrollRef.current.scrollLeft = (initialDigit - 1) * SLOT_WIDTH;
+    }
+  }, [initialDigit]);
+
+  // Keep synced if lastChosenDigit changes externally
+  useEffect(() => {
+    if (lastChosenDigit && lastChosenDigit >= 1 && lastChosenDigit <= 9) {
+      if (lastChosenDigit !== focalDigitRef.current) {
+        scrollToDigit(lastChosenDigit, true);
+      }
+    }
+  }, [lastChosenDigit, scrollToDigit]);
+
+  // Track user swipe/scroll to identify the centered digit
+  const handleScroll = () => {
+    if (!scrollRef.current) return;
+    const currentScroll = scrollRef.current.scrollLeft;
+    const activeIndex = Math.round(currentScroll / SLOT_WIDTH);
+    const newDigit = Math.max(1, Math.min(9, activeIndex + 1));
+
+    if (newDigit !== focalDigitRef.current) {
+      focalDigitRef.current = newDigit;
+      setFocalDigit(newDigit);
+      if (!isProgrammaticScrollRef.current) {
+        triggerStepFeedback();
+      }
+    }
+  };
+
+  // Step left (-1)
   const handleStepLeft = (e?: React.MouseEvent) => {
     e?.stopPropagation();
-    setFocalDigit((prev) => {
-      const next = prev === 1 ? 9 : prev - 1;
-      triggerStepFeedback();
-      return next;
-    });
+    const next = focalDigit === 1 ? 9 : focalDigit - 1;
+    scrollToDigit(next, true);
+    triggerStepFeedback();
   };
 
-  // Move numbers ONLY ONE move at a time (+1 move)
+  // Step right (+1)
   const handleStepRight = (e?: React.MouseEvent) => {
     e?.stopPropagation();
-    setFocalDigit((prev) => {
-      const next = prev === 9 ? 1 : prev + 1;
-      triggerStepFeedback();
-      return next;
-    });
+    const next = focalDigit === 9 ? 1 : focalDigit + 1;
+    scrollToDigit(next, true);
+    triggerStepFeedback();
   };
 
-  // Touch Swipe Gesture for 1-move step
-  const touchStartRef = useRef<{ x: number; y: number } | null>(null);
+  // Mouse / Pointer drag support for desktop swipe-to-scroll
+  const isPointerDownRef = useRef(false);
+  const startXRef = useRef(0);
+  const startScrollLeftRef = useRef(0);
 
-  const handleTouchStart = (e: React.TouchEvent) => {
-    if (e.touches.length === 1) {
-      touchStartRef.current = { x: e.touches[0].clientX, y: e.touches[0].clientY };
-    }
+  const handlePointerDown = (e: React.PointerEvent) => {
+    if (!scrollRef.current) return;
+    isPointerDownRef.current = true;
+    startXRef.current = e.clientX;
+    startScrollLeftRef.current = scrollRef.current.scrollLeft;
   };
 
-  const handleTouchEnd = (e: React.TouchEvent) => {
-    if (!touchStartRef.current || e.changedTouches.length === 0) return;
-    const dx = e.changedTouches[0].clientX - touchStartRef.current.x;
-    touchStartRef.current = null;
-
-    if (dx < -25) {
-      handleStepRight(); // Swiped left -> advance +1
-    } else if (dx > 25) {
-      handleStepLeft(); // Swiped right -> step back -1
-    }
+  const handlePointerMove = (e: React.PointerEvent) => {
+    if (!isPointerDownRef.current || !scrollRef.current) return;
+    const dx = e.clientX - startXRef.current;
+    scrollRef.current.scrollLeft = startScrollLeftRef.current - dx;
   };
 
-  // Mouse wheel listener: single move per tick
-  const handleWheelScroll = (e: React.WheelEvent) => {
+  const handlePointerUpOrLeave = () => {
+    isPointerDownRef.current = false;
+  };
+
+  // Mouse wheel scroll to spin through digits
+  const handleWheel = (e: React.WheelEvent) => {
     e.stopPropagation();
-    if (e.deltaY > 10 || e.deltaX > 10) {
+    if (!scrollRef.current) return;
+    if (e.deltaY > 6 || e.deltaX > 6) {
       handleStepRight();
-    } else if (e.deltaY < -10 || e.deltaX < -10) {
+    } else if (e.deltaY < -6 || e.deltaX < -6) {
       handleStepLeft();
     }
   };
 
-  // Place current centered number
-  const handleConfirmPlacement = (e?: React.MouseEvent) => {
-    e?.stopPropagation();
-    onSelectDigit(focalDigit);
+  // Clicking a number in the swipe track
+  const handleSlotClick = (digit: number, e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (digit === focalDigit) {
+      // If already centered, confirm and place into cell!
+      triggerHaptic(20);
+      onSelectDigit(digit);
+    } else {
+      // If not centered, smooth scroll it to center
+      scrollToDigit(digit, true);
+      triggerStepFeedback();
+    }
   };
 
-  // Keyboard navigation within the wheel
+  // Keyboard navigation
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'ArrowLeft' || e.key === 'a' || e.key === 'A') {
@@ -120,45 +170,39 @@ export const TacticalNumberWheel: React.FC<TacticalNumberWheelProps> = ({
         handleStepRight();
       } else if (e.key === 'Enter' || e.key === ' ') {
         e.preventDefault();
-        handleConfirmPlacement();
+        triggerHaptic(20);
+        onSelectDigit(focalDigit);
       } else if (e.key === 'Escape') {
         e.preventDefault();
+        onClose();
+      } else if (e.key === 'Backspace' || e.key === 'Delete' || e.key === '0') {
+        e.preventDefault();
+        triggerHaptic([10, 30, 10]);
+        onClearCell();
         onClose();
       } else if (e.key >= '1' && e.key <= '9') {
         e.preventDefault();
         const digit = parseInt(e.key, 10);
-        setFocalDigit(digit);
+        scrollToDigit(digit, true);
         triggerStepFeedback();
       }
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [focalDigit]);
+  }, [focalDigit, onClose, onClearCell, onSelectDigit, scrollToDigit]);
 
-  // Compute previous and next digits for the single-move visual strip
-  const prevDigit = focalDigit === 1 ? 9 : focalDigit - 1;
-  const nextDigit = focalDigit === 9 ? 1 : focalDigit + 1;
-
-  const currentCount = digitCounts[focalDigit] || 0;
-  const remainingCount = Math.max(0, 9 - currentCount);
-  const isExhausted = currentCount >= 9;
-  const hasNote = cellNotes.has(focalDigit);
-
-  // Position dial relative to target cell, clamping inside board
-  const cellLeftPct = ((col + 0.5) / 9) * 100;
-  const cellTopPct = ((row + 0.5) / 9) * 100;
-
-  const hubLeftPct = Math.max(20, Math.min(80, cellLeftPct));
-  const hubTopPct = Math.max(22, Math.min(78, cellTopPct));
+  // Position: strictly and always centered over the selected cell
+  const cellCenterX = ((col + 0.5) / 9) * 100;
+  const cellCenterY = ((row + 0.5) / 9) * 100;
 
   return (
     <div
-      className="absolute inset-0 z-40 bg-black/65 backdrop-blur-[2px] rounded-lg sm:rounded-xl flex items-center justify-center animate-in fade-in duration-100 touch-manipulation select-none"
+      className="absolute inset-0 z-40 bg-black/40 backdrop-blur-[0.5px] rounded-lg sm:rounded-xl flex items-center justify-center animate-in fade-in duration-75 touch-manipulation select-none"
       onClick={onClose}
     >
-      {/* Target Reticle Indicator directly on the target cell */}
+      {/* Target Reticle Indicator highlighting the selected cell */}
       <div
-        className="absolute border-2 border-amber-400 bg-amber-400/30 rounded-md pointer-events-none ring-2 ring-amber-400/60 shadow-[0_0_16px_rgba(245,158,11,0.7)] z-20 animate-pulse"
+        className="absolute border-2 border-amber-400 bg-amber-400/20 rounded-md pointer-events-none ring-2 ring-amber-400/50 shadow-[0_0_12px_rgba(245,158,11,0.5)] z-20"
         style={{
           left: `${(col / 9) * 100}%`,
           top: `${(row / 9) * 100}%`,
@@ -167,160 +211,109 @@ export const TacticalNumberWheel: React.FC<TacticalNumberWheelProps> = ({
         }}
       />
 
-      {/* Center Tactical Wheel Hub */}
+      {/* Swipe-to-Scroll Wheel Container: Minimized and centered on the selected cell */}
       <div
-        className="absolute w-64 sm:w-72 bg-[#131B2E] border-2 border-amber-500/80 rounded-3xl p-3.5 sm:p-4 shadow-[0_0_35px_rgba(0,0,0,0.8),0_0_20px_rgba(245,158,11,0.25)] space-y-3 z-30 animate-in zoom-in-95 duration-150"
+        className="absolute z-30 animate-in zoom-in-95 duration-75 flex flex-col items-center"
         style={{
-          left: `${hubLeftPct}%`,
-          top: `${hubTopPct}%`,
+          left: `${cellCenterX}%`,
+          top: `${cellCenterY}%`,
           transform: 'translate(-50%, -50%)',
         }}
         onClick={(e) => e.stopPropagation()}
-        onWheel={handleWheelScroll}
-        onTouchStart={handleTouchStart}
-        onTouchEnd={handleTouchEnd}
       >
-        {/* Hub Header: Target Coordinate & Close Button */}
-        <div className="flex items-center justify-between border-b border-slate-800 pb-2">
-          <div className="flex items-center gap-2">
-            <span className="font-mono text-xs font-bold text-amber-300 bg-[#0B0F17] px-2 py-0.5 rounded-md border border-slate-800">
-              R{row + 1}C{col + 1}
-            </span>
-            <span className="text-[10px] text-slate-400 font-medium">Single-Move Dial</span>
-          </div>
+        {/* Minimized Swipe-to-Scroll Pill Container */}
+        <div className="relative w-[172px] h-[50px] rounded-full bg-[#090D16]/95 border-2 border-amber-400 shadow-[0_8px_30px_rgba(0,0,0,0.85),0_0_20px_rgba(245,158,11,0.35)] backdrop-blur-md flex items-center overflow-hidden">
+          {/* Subtle edge fade overlays */}
+          <div className="pointer-events-none absolute left-0 top-0 bottom-0 w-4 bg-gradient-to-r from-[#090D16] to-transparent z-20" />
+          <div className="pointer-events-none absolute right-0 top-0 bottom-0 w-4 bg-gradient-to-l from-[#090D16] to-transparent z-20" />
 
-          <button
-            type="button"
-            onClick={onClose}
-            className="w-6 h-6 rounded-full bg-[#0B0F17] hover:bg-slate-800 border border-slate-700 text-slate-400 hover:text-white flex items-center justify-center cursor-pointer transition-colors"
-            title="Kapat (Escape)"
-          >
-            <X className="w-3.5 h-3.5" />
-          </button>
-        </div>
-
-        {/* Tactical Dial Wheel Row: [ ◀ Step ]  [ Prev ]  [ CENTER FOCUSED NUMBER ]  [ Next ]  [ Step ▶ ] */}
-        <div className="flex items-center justify-between gap-1.5 py-1">
-          {/* Step -1 Button */}
+          {/* Left Step Arrow indicator (tap to step back) */}
           <button
             type="button"
             onClick={handleStepLeft}
-            className="w-10 h-10 rounded-2xl bg-[#0B0F17] hover:bg-slate-800 border border-slate-700 hover:border-amber-400 text-amber-300 flex items-center justify-center cursor-pointer transition-all active:scale-90 shadow-md shrink-0"
-            title="Move numbers -1 move (A / ◀)"
+            className="absolute left-1 z-25 w-5 h-5 rounded-full bg-slate-900/80 hover:bg-slate-800 text-amber-400/80 hover:text-amber-300 flex items-center justify-center cursor-pointer transition-transform active:scale-90"
+            title="Step Left"
             aria-label="Previous Number"
           >
-            <ChevronLeft className="w-5 h-5 stroke-[2.5]" />
+            <ChevronLeft className="w-3.5 h-3.5 stroke-[2.5]" />
           </button>
 
-          {/* Adjacent Previous Number Preview (Tap to move 1 step left) */}
-          <button
-            type="button"
-            onClick={handleStepLeft}
-            className="w-9 h-9 rounded-xl bg-[#0B0F17]/80 hover:bg-slate-800 border border-slate-800 text-slate-400 hover:text-slate-200 flex flex-col items-center justify-center cursor-pointer transition-all active:scale-95 shrink-0"
-            title={`Step to ${prevDigit}`}
-          >
-            <span className="font-mono text-xs font-bold leading-none">{prevDigit}</span>
-            <span className="font-mono text-[7px] text-slate-500 leading-none mt-0.5">
-              {Math.max(0, 9 - (digitCounts[prevDigit] || 0))} left
-            </span>
-          </button>
-
-          {/* CENTER FOCUSED NUMBER: Large, Prominent, Interactive */}
-          <button
-            type="button"
-            onClick={handleConfirmPlacement}
-            className={`w-16 h-16 sm:w-18 sm:h-18 rounded-2xl flex flex-col items-center justify-center cursor-pointer transition-all active:scale-95 shadow-xl border-2 shrink-0 ${
-              isNoteActive
-                ? 'bg-sky-500/25 border-sky-400 text-sky-200 ring-2 ring-sky-400/50 shadow-sky-500/20'
-                : isExhausted
-                ? 'bg-amber-500/10 border-slate-700 text-slate-500 opacity-60'
-                : 'bg-amber-500 border-amber-300 text-slate-950 font-black ring-4 ring-amber-400/30 shadow-amber-500/40 hover:bg-amber-400'
-            }`}
-            title="Tap to Place Number into Cell (Enter / Space)"
-          >
-            <span className="font-mono text-2xl sm:text-3xl font-black leading-none tracking-tight">
-              {focalDigit}
-            </span>
-            <span
-              className={`font-mono text-[9px] font-bold leading-none mt-1 ${
-                isNoteActive ? 'text-sky-300' : isExhausted ? 'text-slate-500' : 'text-slate-900'
-              }`}
-            >
-              {isExhausted ? 'Full (9/9)' : `${remainingCount} left`}
-            </span>
-          </button>
-
-          {/* Adjacent Next Number Preview (Tap to move 1 step right) */}
+          {/* Right Step Arrow indicator (tap to advance) */}
           <button
             type="button"
             onClick={handleStepRight}
-            className="w-9 h-9 rounded-xl bg-[#0B0F17]/80 hover:bg-slate-800 border border-slate-800 text-slate-400 hover:text-slate-200 flex flex-col items-center justify-center cursor-pointer transition-all active:scale-95 shrink-0"
-            title={`Step to ${nextDigit}`}
-          >
-            <span className="font-mono text-xs font-bold leading-none">{nextDigit}</span>
-            <span className="font-mono text-[7px] text-slate-500 leading-none mt-0.5">
-              {Math.max(0, 9 - (digitCounts[nextDigit] || 0))} left
-            </span>
-          </button>
-
-          {/* Step +1 Button */}
-          <button
-            type="button"
-            onClick={handleStepRight}
-            className="w-10 h-10 rounded-2xl bg-[#0B0F17] hover:bg-slate-800 border border-slate-700 hover:border-amber-400 text-amber-300 flex items-center justify-center cursor-pointer transition-all active:scale-90 shadow-md shrink-0"
-            title="Move numbers +1 move (D / ▶)"
+            className="absolute right-1 z-25 w-5 h-5 rounded-full bg-slate-900/80 hover:bg-slate-800 text-amber-400/80 hover:text-amber-300 flex items-center justify-center cursor-pointer transition-transform active:scale-90"
+            title="Step Right"
             aria-label="Next Number"
           >
-            <ChevronRight className="w-5 h-5 stroke-[2.5]" />
+            <ChevronRight className="w-3.5 h-3.5 stroke-[2.5]" />
           </button>
+
+          {/* Fixed Center Target Reticle highlight */}
+          <div className="pointer-events-none absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 w-[40px] h-[40px] rounded-full ring-2 ring-amber-300/40 bg-amber-400/10 shadow-[0_0_12px_rgba(245,158,11,0.25)] z-10" />
+
+          {/* Horizontal Swipe-to-Scroll Track */}
+          <div
+            ref={scrollRef}
+            onScroll={handleScroll}
+            onWheel={handleWheel}
+            onPointerDown={handlePointerDown}
+            onPointerMove={handlePointerMove}
+            onPointerUp={handlePointerUpOrLeave}
+            onPointerLeave={handlePointerUpOrLeave}
+            className="w-full h-full flex items-center overflow-x-auto snap-x snap-mandatory touch-pan-x cursor-grab active:cursor-grabbing select-none"
+            style={{
+              paddingLeft: `calc(50% - ${SLOT_WIDTH / 2}px)`,
+              paddingRight: `calc(50% - ${SLOT_WIDTH / 2}px)`,
+              scrollbarWidth: 'none',
+              msOverflowStyle: 'none',
+            }}
+          >
+            {[1, 2, 3, 4, 5, 6, 7, 8, 9].map((digit) => {
+              const isCentered = digit === focalDigit;
+              return (
+                <div
+                  key={digit}
+                  onClick={(e) => handleSlotClick(digit, e)}
+                  className="snap-center shrink-0 w-[42px] h-[42px] flex items-center justify-center cursor-pointer transition-all"
+                >
+                  <div
+                    className={`w-9 h-9 rounded-full flex items-center justify-center font-mono font-black transition-all ${
+                      isCentered
+                        ? 'bg-gradient-to-b from-amber-400 via-amber-500 to-orange-500 text-slate-950 text-xl shadow-lg ring-2 ring-amber-300 scale-105 active:scale-95'
+                        : 'text-slate-400 text-sm hover:text-white hover:bg-slate-800/60 opacity-60 hover:opacity-100 scale-90'
+                    }`}
+                    title={
+                      isCentered
+                        ? `Tap to place #${digit}`
+                        : `Scroll to #${digit}`
+                    }
+                  >
+                    {digit}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
         </div>
 
-        {/* Quick Actions Row: Primary "Place Number", Note Toggle, Clear Cell */}
-        <div className="flex items-center gap-1.5 pt-1 border-t border-slate-800">
-          {/* Main Action Confirm Button */}
+        {/* Minimal Clear button if cell already has a filled number */}
+        {currentValue > 0 && (
           <button
             type="button"
-            onClick={handleConfirmPlacement}
-            className="flex-1 py-2.5 px-3 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold text-xs flex items-center justify-center gap-1.5 cursor-pointer transition-all shadow-md active:scale-95"
-          >
-            <Check className="w-3.5 h-3.5 stroke-[3]" />
-            <span>Place {focalDigit}</span>
-          </button>
-
-          {/* Toggle Notes Mode */}
-          <button
-            type="button"
-            onClick={() => {
-              setIsNoteActive((prev) => !prev);
-              onToggleNotesMode();
-              triggerStepFeedback();
-            }}
-            className={`p-2.5 rounded-xl border text-xs font-semibold flex items-center justify-center gap-1 transition-all cursor-pointer active:scale-95 shrink-0 ${
-              isNoteActive
-                ? 'bg-sky-500/25 border-sky-400 text-sky-200'
-                : 'bg-[#0B0F17] hover:bg-slate-800 border-slate-800 text-slate-400 hover:text-slate-200'
-            }`}
-            title="Toggle Candidate Note Mode"
-            aria-label="Candidate Note"
-          >
-            <Pencil className="w-3.5 h-3.5" />
-            <span className="text-[11px] hidden sm:inline">Note</span>
-          </button>
-
-          {/* Clear Cell */}
-          <button
-            type="button"
-            onClick={() => {
+            onClick={(e) => {
+              e.stopPropagation();
+              triggerHaptic([10, 30, 10]);
               onClearCell();
               onClose();
             }}
-            className="p-2.5 rounded-xl bg-[#0B0F17] hover:bg-slate-800 border border-slate-800 hover:border-rose-500/50 text-slate-400 hover:text-rose-300 transition-all cursor-pointer active:scale-95 shrink-0"
-            title="Hücreyi Sil (Backspace / 0)"
-            aria-label="Clear Cell"
+            className="mt-1 px-2 py-0.5 rounded-full bg-[#090D16]/95 border border-slate-700/90 hover:border-rose-500/80 text-slate-400 hover:text-rose-300 text-[10px] font-mono flex items-center gap-1 shadow-md cursor-pointer transition-colors active:scale-95"
+            title="Clear cell"
           >
-            <Eraser className="w-3.5 h-3.5" />
+            <Eraser className="w-2.5 h-2.5" />
+            <span>Clear</span>
           </button>
-        </div>
+        )}
       </div>
     </div>
   );

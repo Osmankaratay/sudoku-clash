@@ -99,6 +99,17 @@ const CHORD_PROGRESSIONS: Record<string, TrackChordProgression> = {
   },
 };
 
+/**
+ * Triggers subtle haptic vibration triggers for mobile devices
+ */
+export const triggerHaptic = (pattern: number | number[] = 15) => {
+  try {
+    if (typeof navigator !== 'undefined' && 'vibrate' in navigator) {
+      navigator.vibrate(pattern);
+    }
+  } catch {}
+};
+
 class SoundEngine {
   private ctx: AudioContext | null = null;
   public enabled = true;
@@ -150,6 +161,13 @@ class SoundEngine {
     });
   }
 
+  public toggleSound(): boolean {
+    this.enabled = !this.enabled;
+    triggerHaptic(this.enabled ? [15, 30, 15] : 20);
+    this.notify();
+    return this.enabled;
+  }
+
   public setVolume(vol: number) {
     this.volume = Math.max(0, Math.min(1, vol));
     if (this.volume === 0) {
@@ -173,6 +191,7 @@ class SoundEngine {
   }
 
   public toggleBgm(): boolean {
+    triggerHaptic(15);
     if (this.bgmPlaying) {
       this.stopBgm();
       return false;
@@ -656,35 +675,6 @@ class SoundEngine {
         gain.connect(ctx.destination);
         osc.start(now);
         osc.stop(now + 0.36);
-      });
-    } catch {}
-  }
-
-  /**
-   * Joyful celebration chime when finishing an entire row, column, or 3x3 square
-   */
-  public playSectionComplete() {
-    const ctx = this.getContext();
-    if (!ctx || !this.enabled) return;
-    try {
-      // Ascending crystalline chord: F5 (698.46Hz), A5 (880Hz), C6 (1046.5Hz)
-      const notes = [698.46, 880.0, 1046.5];
-      notes.forEach((freq, idx) => {
-        const now = ctx.currentTime + idx * 0.07;
-        const osc = ctx.createOscillator();
-        const gain = ctx.createGain();
-        osc.type = 'triangle';
-        osc.frequency.setValueAtTime(freq, now);
-        osc.frequency.exponentialRampToValueAtTime(freq * 1.02, now + 0.05);
-
-        const targetGain = 0.12 * this.volume;
-        gain.gain.setValueAtTime(targetGain, now);
-        gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.38);
-
-        osc.connect(gain);
-        gain.connect(ctx.destination);
-        osc.start(now);
-        osc.stop(now + 0.4);
       });
     } catch {}
   }

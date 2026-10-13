@@ -433,7 +433,8 @@ export function recordMatchOutcome(
   rank: number,
   finishTimeMs = 0,
   difficulty = 'Medium',
-  mistakes = 0
+  mistakes = 0,
+  difficultyMultiplier?: number
 ) {
   const user = usersById.get(userId);
   if (!user) return;
@@ -503,6 +504,9 @@ export function recordMatchOutcome(
     score: Math.round(score),
     finishTimeMs,
     mistakes,
+    difficultyMultiplier,
+    timeMultiplier: difficultyMultiplier,
+    outcome: isWin ? 'win' : 'loss',
   };
   user.stats.recentMatches.unshift(record);
   if (user.stats.recentMatches.length > 25) {
@@ -510,6 +514,10 @@ export function recordMatchOutcome(
   }
 
   saveUsersToDisk();
+}
+
+export function getUserById(userId: string): StoredUser | undefined {
+  return usersById.get(userId);
 }
 
 export function getDetailedCareerStats(userId: string): DetailedCareerStats | null {
@@ -541,6 +549,7 @@ export function getDetailedCareerStats(userId: string): DetailedCareerStats | nu
     'Very Hard',
     'Expert',
     'Pro',
+    'Custom',
   ];
   const diffRecord: Record<DifficultyLevel, DifficultyTierStats> = {} as any;
   for (const diff of allDifficulties) {

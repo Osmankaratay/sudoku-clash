@@ -16,11 +16,13 @@ import {
   FriendUser,
   LobbyInvite,
   ErrorFilterCategory,
+  ActivePlayerSummary,
 } from './src/types/game.ts';
 import {
   generateSudokuBoard,
   calculateCompetitiveScore,
   calculatePuzzleSeed,
+  calculateDifficultyMultiplier,
 } from './src/sudokuEngine.ts';
 import {
   registerUser,
@@ -29,6 +31,7 @@ import {
   changePassword,
   mergeGuestStats,
   getUserFromToken,
+  getUserById,
   updateUserProfile,
   recordMatchOutcome,
   addFriend,
@@ -40,6 +43,11 @@ import {
   recordPuzzleSolver,
   getPuzzleLeaderboard,
   getAllTimeLeaderboard,
+  getDailyChallengePublicInfo,
+  getOrCreateDailyChallenge,
+  getPlayerDailyStreak,
+  recordDailyChallengeCompletion,
+  getCurrentUTCDateKey,
 } from './src/puzzleLeaderboardServer.ts';
 
 interface InternalPlayer extends PlayerPublicState {
@@ -53,6 +61,7 @@ interface InternalRoom {
   difficulty: DifficultyLevel;
   status: RoomStateStatus;
   maxPlayers: number;
+  mistakeLimit: number; // 0 = unlimited, 1, 3, 5, 10
   players: Map<string, InternalPlayer>;
   initialBoard: number[][] | null;
   solutionBoard: number[][] | null;
@@ -60,6 +69,8 @@ interface InternalRoom {
   totalEmptyCells: number;
   startTime: number | null;
   firstFinishTimeMs: number | null;
+  feedbackMode?: 'instant' | 'delayed';
+  customClues?: number;
   finishedOrder: string[]; // player IDs in exact order of finishing
   messages: ChatMessage[];
 }
@@ -110,6 +121,14 @@ function serializeRoom(room: InternalRoom): RoomPublicState {
     score: p.score,
     maxPossibleScore: p.maxPossibleScore,
     minPossibleScore: p.minPossibleScore,
+    isEliminated: p.isEliminated,
+    hintsUsed: p.hintsUsed,
+    comboStreak: p.comboStreak,
+    maxCombo: p.maxCombo,
+    difficultyMultiplier: p.difficultyMultiplier,
+    timeMultiplier: p.timeMultiplier,
+    maxScoreCap: p.maxScoreCap,
+    scoreBreakdown: p.scoreBreakdown,
   }));
 
   return {
@@ -118,11 +137,15 @@ function serializeRoom(room: InternalRoom): RoomPublicState {
     difficulty: room.difficulty,
     status: room.status,
     maxPlayers: room.maxPlayers,
+    mistakeLimit: room.mistakeLimit,
     players: playersList,
     startTime: room.startTime,
     firstFinishTimeMs: room.firstFinishTimeMs,
     initialBoard: room.initialBoard,
+    solutionBoard: room.status === 'PLAYING' || room.status === 'FINISHED' ? room.solutionBoard : null,
     puzzleSeed: room.puzzleSeed || undefined,
+    feedbackMode: room.feedbackMode || 'instant',
+    customClues: room.customClues,
     messages: room.messages,
   };
 }
@@ -169,7 +192,12 @@ function handlePlayerCompletion(room: InternalRoom, player: InternalPlayer, io: 
   const scoreResult = calculateCompetitiveScore(
     rank,
     room.firstFinishTimeMs,
-    elapsedMs
+    elapsedMs,
+    room.difficulty,
+    player.mistakes,
+    player.hintsUsed || 0,
+    player.score || undefined,
+    room.customClues
   );
 
   player.rank = rank;
@@ -177,6 +205,10 @@ function handlePlayerCompletion(room: InternalRoom, player: InternalPlayer, io: 
   player.maxPossibleScore = scoreResult.maxPossibleScore;
   player.minPossibleScore = scoreResult.minPossibleScore;
   player.deltaTSeconds = scoreResult.deltaTSeconds;
+  player.difficultyMultiplier = scoreResult.difficultyMultiplier;
+  player.timeMultiplier = scoreResult.difficultyMultiplier;
+  player.maxScoreCap = scoreResult.maxScoreCap;
+  player.scoreBreakdown = scoreResult.scoreBreakdown;
 
   // Record outcome for registered user account if present
   if (player.userId) {
@@ -186,7 +218,8 @@ function handlePlayerCompletion(room: InternalRoom, player: InternalPlayer, io: 
       rank,
       elapsedMs,
       room.difficulty,
-      player.mistakes
+      player.mistakes,
+      player.difficultyMultiplier
     );
   }
 
@@ -484,6 +517,59 @@ async function startServer() {
     res.json({ ok: true });
   });
 
+  function getActivePlayersList(): ActivePlayerSummary[] {
+    const activeMap = new Map<string, ActivePlayerSummary>();
+
+    // 1. All authenticated users with active socket connections
+    for (const [userId, sids] of userSockets.entries()) {
+      if (sids.size === 0) continue;
+      const user = getUserById(userId);
+      if (!user) continue;
+
+      let roomCode: string | null = null;
+      for (const sid of sids) {
+        const r = socketToRoom.get(sid);
+        if (r) {
+          roomCode = r;
+          break;
+        }
+      }
+
+      activeMap.set(user.id, {
+        id: user.id,
+        userId: user.id,
+        username: user.username,
+        avatarId: user.avatarId,
+        online: true,
+        currentRoomCode: roomCode,
+      });
+    }
+
+    // 2. All connected players in active rooms
+    for (const room of rooms.values()) {
+      for (const p of room.players.values()) {
+        if (p.isBot) continue;
+        const key = p.userId || p.id;
+        if (!activeMap.has(key)) {
+          activeMap.set(key, {
+            id: p.id,
+            userId: p.userId,
+            username: p.name,
+            avatarId: p.avatarId,
+            online: true,
+            currentRoomCode: room.code,
+          });
+        }
+      }
+    }
+
+    return Array.from(activeMap.values());
+  }
+
+  app.get('/api/players/active', (_req, res) => {
+    res.json({ ok: true, players: getActivePlayersList() });
+  });
+
   // Detailed Career Statistics Endpoints
   app.get('/api/user/career-stats', (req, res) => {
     const authHeader = req.headers.authorization || '';
@@ -526,10 +612,55 @@ async function startServer() {
   app.get('/api/leaderboard/all-time', (req, res) => {
     try {
       const limit = parseInt(req.query.limit as string, 10) || 50;
-      const data = getAllTimeLeaderboard(limit);
+      const difficulty = (req.query.difficulty as string) || undefined;
+      const data = getAllTimeLeaderboard(limit, difficulty);
       res.json({ ok: true, data });
     } catch (err) {
       res.status(500).json({ ok: false, error: 'Failed to retrieve all-time leaderboard' });
+    }
+  });
+
+  // Daily Challenge Information (High-difficulty 24h board + refresh window)
+  app.get('/api/daily-challenge', (_req, res) => {
+    try {
+      const info = getDailyChallengePublicInfo();
+      res.json({ ok: true, challenge: info });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: 'Failed to retrieve daily challenge' });
+    }
+  });
+
+  // Player Daily Challenge Streak
+  app.get('/api/daily-challenge/streak/:playerKey', (req, res) => {
+    try {
+      const streak = getPlayerDailyStreak(req.params.playerKey);
+      res.json({ ok: true, streak });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: 'Failed to retrieve streak' });
+    }
+  });
+
+  // Complete Daily Challenge Submission
+  app.post('/api/daily-challenge/submit', express.json(), (req, res) => {
+    try {
+      const { playerKey, playerName, avatarId, userId, finishTimeMs, mistakes, score } = req.body;
+      if (!playerKey || !playerName) {
+        return res.status(400).json({ ok: false, error: 'Missing required player data' });
+      }
+
+      const result = recordDailyChallengeCompletion(
+        playerKey,
+        playerName,
+        avatarId || 'avatar-dragon',
+        userId,
+        finishTimeMs || 120000,
+        mistakes || 0,
+        typeof score === 'number' ? score : 95
+      );
+
+      res.json({ ok: true, result });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: 'Failed to record daily challenge' });
     }
   });
 
@@ -551,6 +682,10 @@ async function startServer() {
       callback?.({ ok: false });
     });
 
+    socket.on('players:get_active', (callback?: (res: { ok: boolean; players: ActivePlayerSummary[] }) => void) => {
+      callback?.({ ok: true, players: getActivePlayersList() });
+    });
+
     // Invite friend to private/public lobby
     socket.on(
       'lobby:invite',
@@ -569,7 +704,25 @@ async function startServer() {
           const senderName = senderPlayer?.name || 'A competitor';
           const senderAvatarId = senderPlayer?.avatarId || 'avatar-dragon';
 
-          const targetSockets = userSockets.get(payload.targetUserId);
+          let targetSockets = userSockets.get(payload.targetUserId);
+          if (!targetSockets || targetSockets.size === 0) {
+            if (io.sockets.sockets.get(payload.targetUserId)) {
+              targetSockets = new Set([payload.targetUserId]);
+            } else {
+              for (const [uId, sids] of userSockets.entries()) {
+                const u = getUserById(uId);
+                if (
+                  u &&
+                  (u.username.toLowerCase() === payload.targetUserId.toLowerCase() ||
+                    u.id === payload.targetUserId)
+                ) {
+                  targetSockets = sids;
+                  break;
+                }
+              }
+            }
+          }
+
           if (!targetSockets || targetSockets.size === 0) {
             return callback?.({ ok: false, error: 'Friend is currently offline.' });
           }
@@ -599,7 +752,15 @@ async function startServer() {
     socket.on(
       'room:create',
       (
-        payload: { playerName: string; avatarId?: string; difficulty?: DifficultyLevel; userId?: string },
+        payload: {
+          playerName: string;
+          avatarId?: string;
+          difficulty?: DifficultyLevel;
+          userId?: string;
+          mistakeLimit?: number;
+          feedbackMode?: 'instant' | 'delayed';
+          customClues?: number;
+        },
         callback?: (res: { ok: boolean; room?: RoomPublicState; error?: string }) => void
       ) => {
         try {
@@ -610,6 +771,11 @@ async function startServer() {
             payload?.difficulty && DIFFICULTY_LEVELS.includes(payload.difficulty)
               ? payload.difficulty
               : 'Medium';
+          const feedbackMode = payload?.feedbackMode === 'delayed' ? 'delayed' : 'instant';
+          const customClues =
+            typeof payload?.customClues === 'number'
+              ? Math.max(17, Math.min(65, payload.customClues))
+              : undefined;
 
           leaveCurrentRoom(socket, io);
 
@@ -641,7 +807,10 @@ async function startServer() {
             hostId: socket.id,
             difficulty,
             status: 'LOBBY',
-            maxPlayers: 6,
+            maxPlayers: 999, // Unlimited player capacity
+            mistakeLimit: typeof payload?.mistakeLimit === 'number' ? payload.mistakeLimit : 3,
+            feedbackMode,
+            customClues,
             players: new Map([[socket.id, hostPlayer]]),
             initialBoard: null,
             solutionBoard: null,
@@ -707,14 +876,6 @@ async function startServer() {
           callback?.({
             ok: false,
             error: `Match in room "${rawCode}" is already in progress.`,
-          });
-          return;
-        }
-
-        if (room.players.size >= room.maxPlayers) {
-          callback?.({
-            ok: false,
-            error: `Room "${rawCode}" is full (${room.maxPlayers}/${room.maxPlayers} players).`,
           });
           return;
         }
@@ -873,9 +1034,6 @@ async function startServer() {
         if (room.status !== 'LOBBY') {
           return callback?.({ ok: false, error: 'Cannot add challengers after match start.' });
         }
-        if (room.players.size >= room.maxPlayers) {
-          return callback?.({ ok: false, error: 'Room is at maximum capacity (6 players).' });
-        }
 
         const existingNames = new Set(Array.from(room.players.values()).map((p) => p.name));
         const botConfig =
@@ -971,7 +1129,7 @@ async function startServer() {
     socket.on(
       'room:set_difficulty',
       (
-        payload: { difficulty: DifficultyLevel },
+        payload: { difficulty: DifficultyLevel; customClues?: number },
         callback?: (res: { ok: boolean; error?: string }) => void
       ) => {
         const code = socketToRoom.get(socket.id);
@@ -999,12 +1157,64 @@ async function startServer() {
         }
 
         room.difficulty = payload.difficulty;
+        if (payload.difficulty === 'Custom' && typeof payload.customClues === 'number') {
+          room.customClues = Math.max(17, Math.min(65, Math.floor(payload.customClues)));
+        } else if (payload.difficulty !== 'Custom') {
+          room.customClues = undefined;
+        }
+
+        const clueText = room.difficulty === 'Custom' && room.customClues ? `${room.customClues} clues` : `${DIFFICULTY_CONFIG[payload.difficulty].emptyCells} empty cells`;
         room.messages.push({
           id: `diff_${Date.now()}`,
           senderId: 'system',
           senderName: 'System',
           senderAvatarId: 'avatar-dragon',
-          text: `Match difficulty set to ${payload.difficulty} (${DIFFICULTY_CONFIG[payload.difficulty].emptyCells} empty cells).`,
+          text: `Match difficulty set to ${payload.difficulty} (${clueText}).`,
+          timestamp: Date.now(),
+          isSystem: true,
+        });
+
+        io.to(code).emit('room:updated', serializeRoom(room));
+        callback?.({ ok: true });
+      }
+    );
+
+    // 7.5. Host changes Mistake Limit configuration
+    socket.on(
+      'room:set_mistake_limit',
+      (
+        payload: { mistakeLimit: number },
+        callback?: (res: { ok: boolean; error?: string }) => void
+      ) => {
+        const code = socketToRoom.get(socket.id);
+        if (!code) return callback?.({ ok: false, error: 'Not in a room.' });
+
+        const room = rooms.get(code);
+        if (!room) return callback?.({ ok: false, error: 'Room not found.' });
+
+        if (room.hostId !== socket.id) {
+          return callback?.({
+            ok: false,
+            error: 'Only the room creator (host) can change the mistake limit.',
+          });
+        }
+
+        if (room.status !== 'LOBBY') {
+          return callback?.({
+            ok: false,
+            error: 'Mistake limit cannot be modified after match starts.',
+          });
+        }
+
+        const limit = Math.max(0, Math.min(20, Math.floor(payload?.mistakeLimit ?? 3)));
+        room.mistakeLimit = limit;
+        const limitText = limit === 0 ? 'No Limit (Unlimited)' : `${limit} mistakes`;
+        room.messages.push({
+          id: `mistake_lim_${Date.now()}`,
+          senderId: 'system',
+          senderName: 'System',
+          senderAvatarId: 'avatar-dragon',
+          text: `Match mistake limit configured to: ${limitText}.`,
           timestamp: Date.now(),
           isSystem: true,
         });
@@ -1049,11 +1259,13 @@ async function startServer() {
         }
 
         // Centrally generate the uniquely solvable Sudoku board on the server
-        const { initialBoard, solutionBoard, emptyCellsCount } = generateSudokuBoard(
-          room.difficulty
+        const { initialBoard, solutionBoard, emptyCellsCount, seed } = generateSudokuBoard(
+          room.difficulty,
+          undefined,
+          room.customClues
         );
 
-        room.puzzleSeed = calculatePuzzleSeed(initialBoard);
+        room.puzzleSeed = seed;
         room.initialBoard = initialBoard;
         room.solutionBoard = solutionBoard;
         room.totalEmptyCells = emptyCellsCount;
@@ -1072,12 +1284,19 @@ async function startServer() {
           isSystem: true,
         });
 
+        const startDiffMult = calculateDifficultyMultiplier(room.difficulty, room.customClues);
+
         // Initialize every player's board & telemetry
         for (const p of room.players.values()) {
           p.board = initialBoard.map((row) => [...row]);
           p.filledCount = 0;
           p.totalToFill = emptyCellsCount;
           p.mistakes = 0;
+          p.hintsUsed = 0;
+          p.comboStreak = 0;
+          p.maxCombo = 1;
+          p.difficultyMultiplier = startDiffMult;
+          p.timeMultiplier = startDiffMult;
           p.finished = false;
           p.finishTimeMs = null;
           p.deltaTSeconds = null;
@@ -1132,8 +1351,34 @@ async function startServer() {
           return callback?.({ ok: false, error: 'Coordinates or value out of range.' });
         }
 
-        // Verify cell wasn't already filled correctly
-        if (player.board[row][col] === room.solutionBoard[row][col] && player.board[row][col] !== 0) {
+        // If cell has already been occupied with a number, user cannot change it!
+        if (player.board[row][col] !== 0) {
+          return callback?.({
+            ok: false,
+            error: 'Cell is already occupied and cannot be changed.',
+          });
+        }
+
+        // Handle delayed feedback mode (No immediate approved or wrong notification)
+        if (room.feedbackMode === 'delayed') {
+          player.board[row][col] = value;
+          player.filledCount += 1;
+
+          if (player.filledCount >= player.totalToFill) {
+            let actualMistakes = 0;
+            for (let r = 0; r < 9; r++) {
+              for (let c = 0; c < 9; c++) {
+                if (player.board[r][c] !== room.solutionBoard[r][c]) {
+                  actualMistakes++;
+                }
+              }
+            }
+            player.mistakes = actualMistakes;
+            handlePlayerCompletion(room, player, io);
+          } else {
+            io.to(code).emit('room:updated', serializeRoom(room));
+          }
+
           return callback?.({
             ok: true,
             validation: {
@@ -1141,14 +1386,15 @@ async function startServer() {
               col,
               value,
               correct: true,
-              alreadyFilled: true,
-              mistakes: player.mistakes,
+              mistakes: 0,
               filledCount: player.filledCount,
               totalToFill: player.totalToFill,
               finished: player.finished,
               rank: player.rank,
               score: player.score,
               deltaTSeconds: player.deltaTSeconds,
+              difficultyMultiplier: player.difficultyMultiplier,
+              timeMultiplier: player.timeMultiplier,
             },
           });
         }
@@ -1166,6 +1412,32 @@ async function startServer() {
           }
         } else {
           player.mistakes += 1;
+          if (room.mistakeLimit > 0 && player.mistakes >= room.mistakeLimit && !player.finished) {
+            player.isEliminated = true;
+            player.finished = true;
+            const elapsed = room.startTime ? Math.max(100, Date.now() - room.startTime) : 1000;
+            player.finishTimeMs = elapsed;
+            player.rank = room.players.size;
+            player.score = 0;
+
+            room.messages.push({
+              id: `elim_${Date.now()}`,
+              senderId: 'system',
+              senderName: 'System',
+              senderAvatarId: player.avatarId,
+              text: `❌ ${player.name} reached the mistake limit (${player.mistakes}/${room.mistakeLimit}) and was knocked out!`,
+              timestamp: Date.now(),
+              isSystem: true,
+            });
+
+            const allFinished = Array.from(room.players.values())
+              .filter((p) => p.connected)
+              .every((p) => p.finished);
+            if (allFinished) {
+              room.status = 'FINISHED';
+              clearRoomBots(room);
+            }
+          }
           io.to(code).emit('room:updated', serializeRoom(room));
         }
 
@@ -1181,9 +1453,131 @@ async function startServer() {
           rank: player.rank,
           score: player.score,
           deltaTSeconds: player.deltaTSeconds,
+          isEliminated: player.isEliminated,
+          difficultyMultiplier: player.difficultyMultiplier,
+          timeMultiplier: player.timeMultiplier,
         };
 
         callback?.({ ok: true, validation });
+      }
+    );
+
+    // 9.2. Local-authoritative gameplay telemetry sync: sends results & periodic time updates to other players
+    socket.on(
+      'player:sync_progress',
+      (
+        payload: {
+          filledCount: number;
+          mistakes: number;
+          finished?: boolean;
+          finishTimeMs?: number;
+          isEliminated?: boolean;
+          score?: number;
+          hintsUsed?: number;
+          comboStreak?: number;
+          maxCombo?: number;
+          difficultyMultiplier?: number;
+          timeMultiplier?: number;
+          maxScoreCap?: number | null;
+          scoreBreakdown?: any;
+        },
+        callback?: (res: { ok: boolean; rank?: number | null; score?: number | null; error?: string }) => void
+      ) => {
+        const code = socketToRoom.get(socket.id);
+        if (!code) return callback?.({ ok: false, error: 'Not in a room.' });
+
+        const room = rooms.get(code);
+        if (!room || room.status !== 'PLAYING') return callback?.({ ok: false, error: 'No active match.' });
+
+        const player = room.players.get(socket.id);
+        if (!player) return callback?.({ ok: false, error: 'Player not found.' });
+
+        if (typeof payload.filledCount === 'number') {
+          player.filledCount = payload.filledCount;
+        }
+        if (typeof payload.mistakes === 'number') {
+          player.mistakes = payload.mistakes;
+        }
+        if (typeof payload.hintsUsed === 'number') {
+          player.hintsUsed = payload.hintsUsed;
+        }
+        if (typeof payload.comboStreak === 'number') {
+          player.comboStreak = payload.comboStreak;
+        }
+        if (typeof payload.maxCombo === 'number') {
+          player.maxCombo = payload.maxCombo;
+        }
+        if (typeof payload.difficultyMultiplier === 'number') {
+          player.difficultyMultiplier = payload.difficultyMultiplier;
+        }
+        if (typeof payload.timeMultiplier === 'number') {
+          player.timeMultiplier = payload.timeMultiplier;
+        }
+        if (payload.maxScoreCap !== undefined) {
+          player.maxScoreCap = payload.maxScoreCap;
+        }
+        if (payload.scoreBreakdown) {
+          player.scoreBreakdown = payload.scoreBreakdown;
+        }
+        if (typeof payload.score === 'number') {
+          player.score = payload.score;
+        }
+
+        // Mistake limit elimination
+        if (
+          (payload.isEliminated || (room.mistakeLimit > 0 && player.mistakes >= room.mistakeLimit)) &&
+          !player.finished
+        ) {
+          player.isEliminated = true;
+          player.finished = true;
+          const elapsed = room.startTime ? Math.max(100, Date.now() - room.startTime) : 1000;
+          player.finishTimeMs = payload.finishTimeMs || elapsed;
+          player.rank = room.players.size;
+          player.score = 0;
+
+          // Record match outcome for user account
+          if (player.userId) {
+            recordMatchOutcome(
+              player.userId,
+              0,
+              player.rank,
+              player.finishTimeMs,
+              room.difficulty,
+              player.mistakes
+            );
+          }
+
+          room.messages.push({
+            id: `elim_${Date.now()}`,
+            senderId: 'system',
+            senderName: 'System',
+            senderAvatarId: player.avatarId,
+            text: `❌ ${player.name} reached the mistake limit (${player.mistakes}/${room.mistakeLimit}) and was knocked out!`,
+            timestamp: Date.now(),
+            isSystem: true,
+          });
+
+          const allFinished = Array.from(room.players.values())
+            .filter((p) => p.connected)
+            .every((p) => p.finished);
+          if (allFinished) {
+            room.status = 'FINISHED';
+            clearRoomBots(room);
+          }
+
+          io.to(code).emit('room:updated', serializeRoom(room));
+          return callback?.({ ok: true, rank: player.rank, score: 0 });
+        }
+
+        // Finished completion
+        if (payload.finished && !player.finished) {
+          handlePlayerCompletion(room, player, io);
+          return callback?.({ ok: true, rank: player.rank, score: player.score });
+        }
+
+        // Broadcast live progress telemetry to all competitors in room
+        io.to(code).emit('room:updated', serializeRoom(room));
+        callback?.({ ok: true, rank: player.rank, score: player.score });
       }
     );
 
@@ -1386,7 +1780,10 @@ async function startServer() {
   // Mount Vite middleware in development or static dist in production
   if (process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: {
+        middlewareMode: true,
+        hmr: false,
+      },
       appType: 'spa',
     });
     app.use(vite.middlewares);

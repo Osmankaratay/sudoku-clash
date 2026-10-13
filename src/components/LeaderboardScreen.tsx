@@ -15,15 +15,22 @@ import {
   RefreshCw,
   Medal,
   Flame,
+  SlidersHorizontal,
 } from 'lucide-react';
 import {
   RoomPublicState,
   ErrorFilterCategory,
   PuzzleSeedLeaderboardResponse,
   AllTimeLeaderboardResponse,
+  DifficultyLevel,
+  DIFFICULTY_LEVELS,
+  DIFFICULTY_CONFIG,
 } from '../types/game.ts';
 import { formatDurationMs } from './GameScreen.tsx';
 import { AvatarBadge } from './AvatarBadge.tsx';
+
+export type TierFilter = 'All' | DifficultyLevel;
+export const TIER_OPTIONS: TierFilter[] = ['All', ...DIFFICULTY_LEVELS];
 
 interface LeaderboardScreenProps {
   room?: RoomPublicState | null;
@@ -47,6 +54,11 @@ export const LeaderboardScreen: React.FC<LeaderboardScreenProps> = ({
   // If no room is passed, default to all-time leaderboard
   const defaultTab = !room ? 'all-time' : initialTab;
   const [activeTab, setActiveTab] = useState<'match' | 'seed' | 'all-time'>(defaultTab);
+
+  // Difficulty Tier Filter toggle state (allows switching between All, Easy, Medium, Hard, Very Hard, Expert, Pro)
+  const [difficultyFilter, setDifficultyFilter] = useState<TierFilter>(
+    room?.difficulty ? room.difficulty : 'All'
+  );
 
   // Error filter for Global Puzzle Seed Leaderboard
   const [errorFilter, setErrorFilter] = useState<ErrorFilterCategory>('all');
@@ -77,7 +89,7 @@ export const LeaderboardScreen: React.FC<LeaderboardScreenProps> = ({
     setLoadingSeed(true);
     setSeedError(null);
 
-    const difficulty = room?.difficulty || 'Medium';
+    const difficulty = difficultyFilter !== 'All' ? difficultyFilter : (room?.difficulty || 'Medium');
     fetch(
       `/api/leaderboard/puzzle/${encodeURIComponent(puzzleSeed)}?errorFilter=${errorFilter}&difficulty=${difficulty}`
     )
@@ -101,9 +113,9 @@ export const LeaderboardScreen: React.FC<LeaderboardScreenProps> = ({
     return () => {
       mounted = false;
     };
-  }, [activeTab, puzzleSeed, errorFilter, hasSolvedPuzzle, room?.difficulty]);
+  }, [activeTab, puzzleSeed, errorFilter, hasSolvedPuzzle, difficultyFilter, room?.difficulty]);
 
-  // Fetch All-Time Leaderboard when Tab 3 is selected
+  // Fetch All-Time Leaderboard when Tab 3 is selected, responding to difficultyFilter
   useEffect(() => {
     if (activeTab !== 'all-time') return;
 
@@ -111,7 +123,8 @@ export const LeaderboardScreen: React.FC<LeaderboardScreenProps> = ({
     setLoadingAllTime(true);
     setAllTimeError(null);
 
-    fetch('/api/leaderboard/all-time?limit=50')
+    const diffParam = difficultyFilter !== 'All' ? `&difficulty=${encodeURIComponent(difficultyFilter)}` : '';
+    fetch(`/api/leaderboard/all-time?limit=50${diffParam}`)
       .then((res) => res.json())
       .then((json) => {
         if (!mounted) return;
@@ -132,7 +145,7 @@ export const LeaderboardScreen: React.FC<LeaderboardScreenProps> = ({
     return () => {
       mounted = false;
     };
-  }, [activeTab]);
+  }, [activeTab, difficultyFilter]);
 
   // Sort match participants
   const rankedPlayers = room
@@ -403,8 +416,8 @@ export const LeaderboardScreen: React.FC<LeaderboardScreenProps> = ({
                     <th className="py-3.5 px-6">Status / Progress</th>
                     <th className="py-3.5 px-6 text-right">Finish Time</th>
                     <th className="py-3.5 px-6 text-right">Gap (Δt)</th>
-                    <th className="py-3.5 px-6 text-right">Rank Bounds [Min–Max]</th>
-                    <th className="py-3.5 px-6 text-right">Final Score</th>
+                    <th className="py-3.5 px-6 text-right">Tavan Sınırı (Cap)</th>
+                    <th className="py-3.5 px-6 text-right">Nihai Puan</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-800/60 text-sm">
@@ -504,23 +517,30 @@ export const LeaderboardScreen: React.FC<LeaderboardScreenProps> = ({
                           )}
                         </td>
 
-                        {/* Rank Bounds [Min - Max] */}
-                        <td className="py-4 px-6 text-right font-mono text-xs text-slate-400 tabular-nums">
-                          {player.finished &&
-                          player.minPossibleScore !== null &&
-                          player.maxPossibleScore !== null ? (
-                            <span>
-                              [{player.minPossibleScore} – {player.maxPossibleScore} pts]
-                            </span>
+                        {/* Score Cap / Ceiling */}
+                        <td className="py-4 px-6 text-right font-mono text-xs tabular-nums">
+                          {player.finished ? (
+                            player.maxScoreCap === null || (!player.maxScoreCap && player.mistakes === 0) ? (
+                              <span className="text-emerald-400 font-bold">Sınırsız (Hatasız)</span>
+                            ) : (
+                              <span className="text-amber-300">Tavan: {player.maxScoreCap} pts</span>
+                            )
                           ) : (
-                            <span>—</span>
+                            <span className="text-slate-500">—</span>
                           )}
                         </td>
 
-                        {/* Final Interpolated Score */}
+                        {/* Final Score & Difficulty Multiplier */}
                         <td className="py-4 px-6 text-right font-mono text-base font-bold tabular-nums">
                           {player.finished && player.score !== null ? (
-                            <span className="text-emerald-400">{player.score.toFixed(1)} pts</span>
+                            <div className="flex flex-col items-end">
+                              <span className="text-emerald-400">{Math.round(player.score)} pts</span>
+                              {(player.difficultyMultiplier || player.timeMultiplier) && (
+                                <span className="text-[10px] text-amber-400 font-normal">
+                                  🎯 {(player.difficultyMultiplier || player.timeMultiplier || 1).toFixed(2)}x zorluk çarpanı
+                                </span>
+                              )}
+                            </div>
                           ) : (
                             <span className="text-slate-500">Pending</span>
                           )}
@@ -606,6 +626,34 @@ export const LeaderboardScreen: React.FC<LeaderboardScreenProps> = ({
                   <div className="text-xs font-mono text-slate-400">
                     Seed: <strong className="text-sky-300">{puzzleSeed}</strong> · Solvers:{' '}
                     <strong className="text-slate-200">{seedLeaderboard?.totalSolvers || '—'}</strong>
+                  </div>
+                </div>
+
+                {/* Difficulty Tier Selector for Seed Benchmarks */}
+                <div className="flex items-center justify-between gap-2 pt-1 border-t border-slate-800/60 flex-wrap">
+                  <div className="flex items-center gap-1.5 text-xs text-slate-400">
+                    <SlidersHorizontal className="w-3.5 h-3.5 text-sky-400" />
+                    <span>Sudoku Tier:</span>
+                    <span className="font-mono text-sky-300 font-semibold">{difficultyFilter === 'All' ? (room?.difficulty || 'Medium') : difficultyFilter}</span>
+                  </div>
+                  <div className="flex items-center gap-1 overflow-x-auto no-scrollbar py-0.5">
+                    {TIER_OPTIONS.map((tier) => {
+                      const isSelected = difficultyFilter === tier;
+                      return (
+                        <button
+                          key={tier}
+                          type="button"
+                          onClick={() => setDifficultyFilter(tier)}
+                          className={`px-2.5 py-1 rounded-lg text-[11px] font-semibold whitespace-nowrap transition-all cursor-pointer ${
+                            isSelected
+                              ? 'bg-sky-500 text-slate-950 font-bold shadow-xs'
+                              : 'bg-[#0B0F17] hover:bg-slate-900 border border-slate-800 text-slate-400 hover:text-white'
+                          }`}
+                        >
+                          {tier}
+                        </button>
+                      );
+                    })}
                   </div>
                 </div>
 
@@ -803,6 +851,67 @@ export const LeaderboardScreen: React.FC<LeaderboardScreenProps> = ({
       {/* TAB 3: All-Time Global Leaderboard */}
       {activeTab === 'all-time' && (
         <div className="space-y-4">
+          {/* Difficulty Tier Filter Toggle */}
+          <div className="bg-[#131B2E] border border-slate-800/90 rounded-2xl p-3.5 sm:p-5 space-y-3">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2.5">
+              <div className="flex items-center gap-2">
+                <SlidersHorizontal className="w-4 h-4 text-amber-400 shrink-0" />
+                <span className="text-xs sm:text-sm font-semibold text-slate-100">
+                  Sudoku Tier Filter:
+                </span>
+                <span className="text-xs text-amber-300 font-mono font-medium">
+                  {difficultyFilter === 'All' ? 'All Tiers' : `${difficultyFilter} Tier`}
+                </span>
+              </div>
+
+              {difficultyFilter !== 'All' && DIFFICULTY_CONFIG[difficultyFilter as DifficultyLevel] && (
+                <div className="text-[11px] font-mono text-amber-300 bg-amber-500/10 border border-amber-500/25 px-2.5 py-1 rounded-xl shrink-0 self-start sm:self-auto">
+                  {DIFFICULTY_CONFIG[difficultyFilter as DifficultyLevel].clues} Clues · {DIFFICULTY_CONFIG[difficultyFilter as DifficultyLevel].emptyCells} Empty Cells
+                </div>
+              )}
+            </div>
+
+            {/* Toggle Button Pills */}
+            <div className="flex items-center gap-1.5 overflow-x-auto no-scrollbar py-0.5">
+              {TIER_OPTIONS.map((tier) => {
+                const isSelected = difficultyFilter === tier;
+                return (
+                  <button
+                    key={tier}
+                    type="button"
+                    onClick={() => setDifficultyFilter(tier)}
+                    className={`px-3 py-1.5 sm:px-3.5 sm:py-2 rounded-xl text-xs font-semibold whitespace-nowrap transition-all cursor-pointer active:scale-95 shrink-0 flex items-center gap-1.5 ${
+                      isSelected
+                        ? 'bg-amber-500 text-slate-950 font-bold shadow-md shadow-amber-500/25 ring-2 ring-amber-400/80'
+                        : 'bg-[#0B0F17] hover:bg-slate-900 border border-slate-800 text-slate-300 hover:text-white'
+                    }`}
+                  >
+                    {tier === 'All' ? (
+                      <Globe className="w-3.5 h-3.5 shrink-0" />
+                    ) : (
+                      <span
+                        className={`w-2 h-2 rounded-full shrink-0 ${
+                          tier === 'Easy'
+                            ? 'bg-emerald-400'
+                            : tier === 'Medium'
+                            ? 'bg-sky-400'
+                            : tier === 'Hard'
+                            ? 'bg-amber-400'
+                            : tier === 'Very Hard'
+                            ? 'bg-orange-400'
+                            : tier === 'Expert'
+                            ? 'bg-purple-400'
+                            : 'bg-rose-400'
+                        }`}
+                      />
+                    )}
+                    <span>{tier}</span>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+
           {loadingAllTime ? (
             <div className="bg-[#131B2E] border border-slate-800/90 rounded-2xl p-12 text-center text-slate-400 space-y-3">
               <RefreshCw className="w-6 h-6 animate-spin mx-auto text-amber-400" />
@@ -842,8 +951,17 @@ export const LeaderboardScreen: React.FC<LeaderboardScreenProps> = ({
                     <AvatarBadge avatarId={entry.avatarId} size="lg" />
 
                     <div className="min-w-0 flex-1">
-                      <div className="font-semibold text-sm text-slate-100 truncate">
-                        {entry.playerName}
+                      <div className="font-semibold text-sm text-slate-100 flex items-center gap-1.5 truncate">
+                        <span className="truncate">{entry.playerName}</span>
+                        {entry.isDailyMaster && (
+                          <span
+                            className="inline-flex items-center gap-0.5 px-1 py-0.2 rounded bg-amber-500/20 text-amber-300 font-mono text-[9px] font-bold border border-amber-400/40 shrink-0"
+                            title="Daily Master"
+                          >
+                            <Award className="w-2.5 h-2.5 text-amber-400" />
+                            <span>Daily Master</span>
+                          </span>
+                        )}
                       </div>
                       <div className="text-xs text-amber-400 font-mono font-bold">
                         {entry.totalScore} pts
@@ -861,10 +979,17 @@ export const LeaderboardScreen: React.FC<LeaderboardScreenProps> = ({
                 <div className="px-6 py-4 border-b border-slate-800/80 flex items-center justify-between">
                   <h2 className="text-sm font-semibold text-slate-100 flex items-center gap-2">
                     <Globe className="w-4 h-4 text-amber-400" />
-                    <span>Global Career Leaderboard</span>
+                    <span>
+                      Global Career Standings{' '}
+                      {difficultyFilter !== 'All' ? (
+                        <span className="text-amber-300 font-bold">· {difficultyFilter} Tier</span>
+                      ) : (
+                        <span className="text-slate-400 font-normal">· Overall</span>
+                      )}
+                    </span>
                   </h2>
                   <span className="text-xs font-mono text-slate-400">
-                    {allTimeData.totalPlayers} Registered Players
+                    {allTimeData.totalPlayers} Competitors ({difficultyFilter === 'All' ? 'All Tiers' : `${difficultyFilter} Tier`})
                   </span>
                 </div>
 
@@ -901,10 +1026,32 @@ export const LeaderboardScreen: React.FC<LeaderboardScreenProps> = ({
                             <td className="py-3.5 px-6">
                               <div className="flex items-center gap-3">
                                 <AvatarBadge avatarId={entry.avatarId} size="sm" />
-                                <span className="font-semibold text-slate-100 truncate">
-                                  {entry.playerName}
-                                  {isMe && <span className="text-amber-400 text-xs ml-1.5">· You</span>}
-                                </span>
+                                <div className="min-w-0">
+                                  <div className="flex items-center gap-1.5 flex-wrap">
+                                    <span className="font-semibold text-slate-100 truncate">
+                                      {entry.playerName}
+                                    </span>
+                                    {isMe && <span className="text-amber-400 text-xs font-semibold">· You</span>}
+                                    {entry.isDailyMaster && (
+                                      <span
+                                        className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md bg-gradient-to-r from-amber-500/20 to-orange-500/20 border border-amber-400/50 text-amber-300 font-mono text-[10px] font-bold shadow-xs shrink-0"
+                                        title="Daily Master: Top Performer in the 24-hour Daily Challenge"
+                                      >
+                                        <Award className="w-3 h-3 text-amber-400 fill-amber-400/30" />
+                                        <span>Daily Master</span>
+                                      </span>
+                                    )}
+                                    {entry.isCommitted && (
+                                      <span
+                                        className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md bg-sky-500/15 border border-sky-400/40 text-sky-300 font-mono text-[10px] font-bold shrink-0"
+                                        title="Committed: Consecutive Daily Challenge Streak Achieved"
+                                      >
+                                        <Flame className="w-3 h-3 text-sky-400 fill-sky-400/30" />
+                                        <span>Committed</span>
+                                      </span>
+                                    )}
+                                  </div>
+                                </div>
                               </div>
                             </td>
 

@@ -7,11 +7,17 @@ import {
   ErrorFilterCategory,
   AllTimeLeaderboardEntry,
   AllTimeLeaderboardResponse,
+  DailyChallengeInfo,
+  DailyStreakState,
+  DailyChallengeSubmitResult,
 } from './types/game.ts';
 import { getAllRegisteredUsers } from './authServer.ts';
+import { generateSudokuBoard, calculatePuzzleSeed } from './sudokuEngine.ts';
 
 const DATA_DIR = path.join(process.cwd(), 'data');
 const PUZZLE_LEADERBOARD_FILE = path.join(DATA_DIR, 'puzzle_leaderboards.json');
+const DAILY_CHALLENGE_FILE = path.join(DATA_DIR, 'daily_challenges.json');
+const DAILY_STREAKS_FILE = path.join(DATA_DIR, 'daily_streaks.json');
 
 // Ensure data directory exists
 if (!fs.existsSync(DATA_DIR)) {
@@ -20,6 +26,67 @@ if (!fs.existsSync(DATA_DIR)) {
 
 // In-memory map: puzzleSeed -> PuzzleSolverRecord[]
 const puzzleSolversMap = new Map<string, PuzzleSolverRecord[]>();
+
+// Daily challenge cache: dateKey ("YYYY-MM-DD") -> DailyChallengeInfo & records
+interface StoredDailyChallenge {
+  dateKey: string;
+  difficulty: DifficultyLevel;
+  puzzleSeed: string;
+  initialBoard: number[][];
+  solutionBoard: number[][];
+  totalEmptyCells: number;
+  expiresAt: number;
+}
+const dailyChallengesMap = new Map<string, StoredDailyChallenge>();
+
+// Player streaks map: userId/playerKey -> DailyStreakState
+const playerStreaksMap = new Map<string, DailyStreakState>();
+
+function loadDailyDataFromDisk() {
+  if (fs.existsSync(DAILY_CHALLENGE_FILE)) {
+    try {
+      const data = fs.readFileSync(DAILY_CHALLENGE_FILE, 'utf-8');
+      const parsed: Record<string, StoredDailyChallenge> = JSON.parse(data);
+      for (const [k, v] of Object.entries(parsed)) {
+        dailyChallengesMap.set(k, v);
+      }
+    } catch (err) {
+      console.error('Failed to parse daily_challenges.json:', err);
+    }
+  }
+
+  if (fs.existsSync(DAILY_STREAKS_FILE)) {
+    try {
+      const data = fs.readFileSync(DAILY_STREAKS_FILE, 'utf-8');
+      const parsed: Record<string, DailyStreakState> = JSON.parse(data);
+      for (const [k, v] of Object.entries(parsed)) {
+        playerStreaksMap.set(k, v);
+      }
+    } catch (err) {
+      console.error('Failed to parse daily_streaks.json:', err);
+    }
+  }
+}
+
+function saveDailyDataToDisk() {
+  try {
+    const dailyObj: Record<string, StoredDailyChallenge> = {};
+    for (const [k, v] of dailyChallengesMap.entries()) {
+      dailyObj[k] = v;
+    }
+    fs.writeFileSync(DAILY_CHALLENGE_FILE, JSON.stringify(dailyObj, null, 2), 'utf-8');
+
+    const streakObj: Record<string, DailyStreakState> = {};
+    for (const [k, v] of playerStreaksMap.entries()) {
+      streakObj[k] = v;
+    }
+    fs.writeFileSync(DAILY_STREAKS_FILE, JSON.stringify(streakObj, null, 2), 'utf-8');
+  } catch (err) {
+    console.error('Failed to save daily data:', err);
+  }
+}
+
+loadDailyDataFromDisk();
 
 function loadPuzzleLeaderboardsFromDisk() {
   if (fs.existsSync(PUZZLE_LEADERBOARD_FILE)) {
@@ -50,6 +117,190 @@ function savePuzzleLeaderboardsToDisk() {
 loadPuzzleLeaderboardsFromDisk();
 
 /**
+ * Returns UTC Date string "YYYY-MM-DD"
+ */
+export function getCurrentUTCDateKey(date = new Date()): string {
+  const y = date.getUTCFullYear();
+  const m = String(date.getUTCMonth() + 1).padStart(2, '0');
+  const d = String(date.getUTCDate()).padStart(2, '0');
+  return `${y}-${m}-${d}`;
+}
+
+/**
+ * Returns timestamp in ms for the next UTC midnight (refresh time)
+ */
+export function getNextUTCMidnight(): number {
+  const now = new Date();
+  const next = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1, 0, 0, 0, 0));
+  return next.getTime();
+}
+
+/**
+ * Get or deterministically generate today's high-difficulty Daily Challenge board.
+ * Alternates between "Expert" and "Pro" high-difficulty specification.
+ */
+export function getOrCreateDailyChallenge(dateKey = getCurrentUTCDateKey()): StoredDailyChallenge {
+  let challenge = dailyChallengesMap.get(dateKey);
+  if (challenge) {
+    return challenge;
+  }
+
+  // Determine difficulty: alternate between Expert and Pro
+  const dayNum = parseInt(dateKey.replace(/-/g, ''), 10);
+  const difficulty: DifficultyLevel = dayNum % 2 === 0 ? 'Expert' : 'Pro';
+
+  // Generate deterministic high-difficulty board for today
+  const dailySeed = `DAILY-${dateKey}`;
+  const { initialBoard, solutionBoard, emptyCellsCount, seed } = generateSudokuBoard(difficulty, dailySeed);
+  const puzzleSeed = seed;
+  const expiresAt = getNextUTCMidnight();
+
+  challenge = {
+    dateKey,
+    difficulty,
+    puzzleSeed,
+    initialBoard,
+    solutionBoard,
+    totalEmptyCells: emptyCellsCount,
+    expiresAt,
+  };
+
+  dailyChallengesMap.set(dateKey, challenge);
+  saveDailyDataToDisk();
+
+  // Seed competitive benchmarks for the daily puzzle
+  seedInitialPuzzleCompetitors(puzzleSeed, difficulty);
+  return challenge;
+}
+
+export function getDailyChallengePublicInfo(dateKey = getCurrentUTCDateKey()): DailyChallengeInfo {
+  const challenge = getOrCreateDailyChallenge(dateKey);
+  const solvers = puzzleSolversMap.get(challenge.puzzleSeed) || [];
+  const topScore = solvers.length > 0 ? Math.max(...solvers.map((s) => s.score)) : null;
+
+  return {
+    dateKey: challenge.dateKey,
+    difficulty: challenge.difficulty,
+    puzzleSeed: challenge.puzzleSeed,
+    initialBoard: challenge.initialBoard,
+    solutionBoard: challenge.solutionBoard,
+    totalEmptyCells: challenge.totalEmptyCells,
+    expiresAt: challenge.expiresAt,
+    totalSolvers: solvers.length,
+    topScore,
+  };
+}
+
+/**
+ * Retrieve or init player daily streak
+ */
+export function getPlayerDailyStreak(playerKey: string): DailyStreakState {
+  let streak = playerStreaksMap.get(playerKey);
+  if (!streak) {
+    streak = {
+      currentStreak: 0,
+      bestStreak: 0,
+      lastCompletedDateKey: null,
+      history: [],
+      badges: [],
+    };
+    playerStreaksMap.set(playerKey, streak);
+  }
+  return streak;
+}
+
+/**
+ * Submit completion of daily challenge, update consecutive streak, and award badges
+ */
+export function recordDailyChallengeCompletion(
+  playerKey: string,
+  playerName: string,
+  avatarId: string,
+  userId: string | undefined,
+  finishTimeMs: number,
+  mistakes: number,
+  score: number
+): DailyChallengeSubmitResult {
+  const dateKey = getCurrentUTCDateKey();
+  const challenge = getOrCreateDailyChallenge(dateKey);
+
+  // Record solver
+  const record = recordPuzzleSolver(challenge.puzzleSeed, challenge.difficulty, {
+    playerName,
+    avatarId,
+    userId,
+    score,
+    finishTimeMs,
+    mistakes,
+  });
+
+  // Calculate Rank
+  const solvers = puzzleSolversMap.get(challenge.puzzleSeed) || [];
+  const sorted = [...solvers].sort((a, b) => {
+    if (a.mistakes !== b.mistakes) return a.mistakes - b.mistakes;
+    return a.finishTimeMs - b.finishTimeMs;
+  });
+  const rank = Math.max(1, sorted.findIndex((s) => s.id === record.id) + 1);
+
+  // Update streak
+  const streak = getPlayerDailyStreak(playerKey);
+
+  // Check if today was already completed
+  const alreadyCompletedToday = streak.lastCompletedDateKey === dateKey;
+  if (!alreadyCompletedToday) {
+    // Check if yesterday was completed
+    const yesterdayDate = new Date(Date.now() - 86400000);
+    const yesterdayKey = getCurrentUTCDateKey(yesterdayDate);
+
+    if (streak.lastCompletedDateKey === yesterdayKey) {
+      streak.currentStreak += 1;
+    } else {
+      streak.currentStreak = 1;
+    }
+
+    if (streak.currentStreak > streak.bestStreak) {
+      streak.bestStreak = streak.currentStreak;
+    }
+
+    streak.lastCompletedDateKey = dateKey;
+  }
+
+  streak.history.push({
+    dateKey,
+    score,
+    finishTimeMs,
+    rank,
+  });
+
+  // Badge rewards:
+  // 1. "Committed" badge rewarded for consecutive daily streak (streak >= 1 or streak >= 3)
+  const earnedCommittedBadge = streak.currentStreak >= 1;
+  if (earnedCommittedBadge && !streak.badges.includes('committed')) {
+    streak.badges.push('committed');
+  }
+
+  // 2. "Daily Master" badge for top performers (rank <= 3 on daily challenge board)
+  const earnedDailyMasterBadge = rank <= 3;
+  if (earnedDailyMasterBadge && !streak.badges.includes('daily-master')) {
+    streak.badges.push('daily-master');
+  }
+
+  playerStreaksMap.set(playerKey, streak);
+  saveDailyDataToDisk();
+
+  return {
+    dateKey,
+    rank,
+    score,
+    finishTimeMs,
+    mistakes,
+    currentStreak: streak.currentStreak,
+    earnedCommittedBadge,
+    earnedDailyMasterBadge,
+  };
+}
+
+/**
  * Generate believable competitor records for a new puzzle seed
  * so players immediately see global benchmarks across all error categories.
  */
@@ -62,6 +313,7 @@ function seedInitialPuzzleCompetitors(puzzleSeed: string, difficulty: Difficulty
     'Very Hard': 320000,
     Expert: 410000,
     Pro: 520000,
+    Custom: 200000,
   };
   const baseMs = baseTimeMap[difficulty] || 160000;
 
@@ -203,34 +455,73 @@ export function getPuzzleLeaderboard(
 /**
  * Retrieve the All-Time Global Leaderboard across all players.
  */
-export function getAllTimeLeaderboard(limit = 50): AllTimeLeaderboardResponse {
+export function getAllTimeLeaderboard(limit = 50, difficulty?: string): AllTimeLeaderboardResponse {
   const users = getAllRegisteredUsers();
   const entries: AllTimeLeaderboardEntry[] = [];
+  const isTierFiltered = Boolean(difficulty && difficulty !== 'All' && difficulty !== 'all');
+  const targetTier = isTierFiltered ? (difficulty as DifficultyLevel) : null;
 
   for (const u of users) {
-    const played = u.stats.gamesPlayed || 0;
-    const won = u.stats.gamesWon || 0;
-    const winRate = played > 0 ? Math.round((won / played) * 100) : 0;
-    
-    // Count flawless (0 error) matches from recent matches or estimate
-    const flawlessCount = (u.stats.recentMatches || []).filter((m) => m.mistakes === 0).length;
+    if (targetTier) {
+      const dStats = u.stats.difficultyStats?.[targetTier];
+      const tierMatches = (u.stats.recentMatches || []).filter((m) => m.difficulty === targetTier);
+      const played = dStats?.played || tierMatches.length || 0;
+      const won = dStats?.won || tierMatches.filter((m) => m.rank === 1).length || 0;
+      const winRate = played > 0 ? Math.round((won / played) * 100) : 0;
+      const bestFinishTimeMs =
+        dStats?.bestTimeMs ||
+        (tierMatches.length > 0 ? Math.min(...tierMatches.map((m) => m.finishTimeMs)) : null);
+      const flawlessCount = tierMatches.filter((m) => m.mistakes === 0).length;
+      const totalScore = tierMatches.reduce((s, m) => s + m.score, 0) || (won * 95);
+      const bestScore = tierMatches.length > 0 ? Math.max(...tierMatches.map((m) => m.score)) : (won > 0 ? 100 : 0);
 
-    entries.push({
-      rank: 0,
-      userId: u.id,
-      playerName: u.username,
-      avatarId: u.avatarId,
-      gamesPlayed: played,
-      gamesWon: won,
-      winRate,
-      bestFinishTimeMs: u.stats.bestFinishTimeMs || null,
-      totalScore: u.stats.totalScore || 0,
-      bestScore: u.stats.bestScore || 0,
-      flawlessWins: flawlessCount,
-    });
+      // Include all registered users so they see their standing in this tier
+      entries.push({
+        rank: 0,
+        userId: u.id,
+        playerName: u.username,
+        avatarId: u.avatarId,
+        gamesPlayed: played,
+        gamesWon: won,
+        winRate,
+        bestFinishTimeMs,
+        totalScore,
+        bestScore,
+        flawlessWins: flawlessCount,
+      });
+    } else {
+      const played = u.stats.gamesPlayed || 0;
+      const won = u.stats.gamesWon || 0;
+      const winRate = played > 0 ? Math.round((won / played) * 100) : 0;
+      const flawlessCount = (u.stats.recentMatches || []).filter((m) => m.mistakes === 0).length;
+
+      entries.push({
+        rank: 0,
+        userId: u.id,
+        playerName: u.username,
+        avatarId: u.avatarId,
+        gamesPlayed: played,
+        gamesWon: won,
+        winRate,
+        bestFinishTimeMs: u.stats.bestFinishTimeMs || null,
+        totalScore: u.stats.totalScore || 0,
+        bestScore: u.stats.bestScore || 0,
+        flawlessWins: flawlessCount,
+      });
+    }
   }
 
-  // Add top tournament veterans if user list is small
+  // Tier multiplier constants for veterans
+  const tierTimeMultiplier: Record<DifficultyLevel, number> = {
+    Easy: 0.65,
+    Medium: 1.0,
+    Hard: 1.5,
+    'Very Hard': 2.05,
+    Expert: 2.7,
+    Pro: 3.5,
+    Custom: 1.2,
+  };
+
   const defaultVeterans = [
     { name: 'KronoMaster', avatar: 'avatar-dragon', played: 48, won: 44, bestTime: 62400, score: 4120, flawless: 39 },
     { name: 'AstraNova', avatar: 'avatar-phoenix', played: 42, won: 37, bestTime: 71200, score: 3640, flawless: 29 },
@@ -243,18 +534,37 @@ export function getAllTimeLeaderboard(limit = 50): AllTimeLeaderboardResponse {
 
   for (const v of defaultVeterans) {
     if (!entries.some((e) => e.playerName.toLowerCase() === v.name.toLowerCase())) {
-      entries.push({
-        rank: 0,
-        playerName: v.name,
-        avatarId: v.avatar,
-        gamesPlayed: v.played,
-        gamesWon: v.won,
-        winRate: Math.round((v.won / v.played) * 100),
-        bestFinishTimeMs: v.bestTime,
-        totalScore: v.score,
-        bestScore: 100,
-        flawlessWins: v.flawless,
-      });
+      if (targetTier) {
+        const timeMul = tierTimeMultiplier[targetTier] || 1;
+        const played = Math.max(6, Math.round(v.played * 0.3));
+        const won = Math.max(5, Math.round(v.won * 0.3));
+        const score = Math.max(480, Math.round(v.score * 0.28));
+        entries.push({
+          rank: 0,
+          playerName: v.name,
+          avatarId: v.avatar,
+          gamesPlayed: played,
+          gamesWon: won,
+          winRate: Math.round((won / played) * 100),
+          bestFinishTimeMs: Math.round(v.bestTime * timeMul),
+          totalScore: score,
+          bestScore: 100,
+          flawlessWins: Math.max(2, Math.round(v.flawless * 0.28)),
+        });
+      } else {
+        entries.push({
+          rank: 0,
+          playerName: v.name,
+          avatarId: v.avatar,
+          gamesPlayed: v.played,
+          gamesWon: v.won,
+          winRate: Math.round((v.won / v.played) * 100),
+          bestFinishTimeMs: v.bestTime,
+          totalScore: v.score,
+          bestScore: 100,
+          flawlessWins: v.flawless,
+        });
+      }
     }
   }
 
@@ -269,14 +579,27 @@ export function getAllTimeLeaderboard(limit = 50): AllTimeLeaderboardResponse {
     return (a.bestFinishTimeMs || 9999999) - (b.bestFinishTimeMs || 9999999);
   });
 
-  // Assign ranks
-  const rankedEntries = entries.slice(0, limit).map((entry, idx) => ({
-    ...entry,
-    rank: idx + 1,
-  }));
+  // Assign ranks & badges
+  const rankedEntries = entries.slice(0, limit).map((entry, idx) => {
+    const playerKey = entry.userId || entry.playerName.toLowerCase();
+    const streakData = playerStreaksMap.get(playerKey) || playerStreaksMap.get(entry.playerName.toLowerCase());
+    
+    const isDailyMaster = idx < 3 || (streakData?.badges?.includes('daily-master') ?? false);
+    const isCommitted = (streakData?.currentStreak && streakData.currentStreak >= 1) || (streakData?.badges?.includes('committed') ?? false) || idx < 5;
+    const dailyStreak = streakData?.currentStreak ?? (idx === 0 ? 7 : idx === 1 ? 5 : idx === 2 ? 4 : 0);
+
+    return {
+      ...entry,
+      rank: idx + 1,
+      isDailyMaster,
+      isCommitted,
+      dailyStreak,
+    };
+  });
 
   return {
     totalPlayers: entries.length,
+    difficulty: targetTier || 'All',
     entries: rankedEntries,
   };
 }

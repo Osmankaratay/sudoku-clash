@@ -1,12 +1,13 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { io, Socket } from 'socket.io-client';
-import { Volume2, VolumeX, X, UserCog, LogIn, LogOut, Shield, BarChart3, Trophy, WifiOff, Zap } from 'lucide-react';
+import { Volume2, VolumeX, X, UserCog, LogIn, LogOut, Shield, BarChart3, Trophy, WifiOff, Zap, Settings } from 'lucide-react';
 import {
   DifficultyLevel,
   RoomPublicState,
   MoveValidationResponse,
   UserAccount,
   LobbyInvite,
+  MatchHistoryRecord,
 } from './types/game.ts';
 import { LandingScreen } from './components/LandingScreen.tsx';
 import { LobbyScreen } from './components/LobbyScreen.tsx';
@@ -15,14 +16,49 @@ import { LeaderboardScreen } from './components/LeaderboardScreen.tsx';
 import { ProfileModal } from './components/ProfileModal.tsx';
 import { AuthModal } from './components/AuthModal.tsx';
 import { CareerStatsModal } from './components/CareerStatsModal.tsx';
+import { SettingsModal } from './components/SettingsModal.tsx';
 import { BgmController } from './components/BgmController.tsx';
 import { AvatarBadge } from './components/AvatarBadge.tsx';
 import { PWAInstallButton } from './components/PWAInstallButton.tsx';
-import { soundEngine } from './utils/sound.ts';
+import { soundEngine, triggerHaptic } from './utils/sound.ts';
 import { useOnlineStatus } from './hooks/useOnlineStatus.ts';
-import { generateSudokuBoard, calculateCompetitiveScore } from './sudokuEngine.ts';
+import { loadGamePreferences, saveGamePreferences, UserGamePreferences } from './utils/gamePreferences.ts';
+import {
+  generateSudokuBoard,
+  generateSudokuBoardFromSeed,
+  calculateCompetitiveScore,
+  calculateAdvancedPerformanceScore,
+  calculateCellMoveScore,
+  calculateTimeMultiplier,
+  calculateMaxScoreCap,
+  DIFFICULTY_SCORE_CONFIG,
+  solveSudoku,
+} from './sudokuEngine.ts';
+import { BOARD_THEMES, BoardThemeId } from './utils/boardThemes.ts';
 
 type ActiveView = 'LANDING' | 'LOBBY' | 'GAME' | 'LEADERBOARD';
+
+export function saveLocalMatchHistory(match: MatchHistoryRecord) {
+  if (typeof window === 'undefined') return;
+  try {
+    const raw = localStorage.getItem('nueve_match_history');
+    const list: MatchHistoryRecord[] = raw ? JSON.parse(raw) : [];
+    if (
+      list.some(
+        (m) =>
+          m.id === match.id ||
+          (Math.abs((m.timestamp || 0) - (match.timestamp || 0)) < 3000 && m.score === match.score)
+      )
+    ) {
+      return;
+    }
+    list.unshift(match);
+    if (list.length > 25) list.pop();
+    localStorage.setItem('nueve_match_history', JSON.stringify(list));
+  } catch (err) {
+    console.error('Failed to save match history locally', err);
+  }
+}
 
 export function App() {
   const socketRef = useRef<Socket | null>(null);
@@ -47,6 +83,7 @@ export function App() {
 
   const [showProfileModal, setShowProfileModal] = useState(false);
   const [showCareerStatsModal, setShowCareerStatsModal] = useState(false);
+  const [showSettingsModal, setShowSettingsModal] = useState(false);
 
   const [room, setRoom] = useState<RoomPublicState | null>(null);
   const [view, setView] = useState<ActiveView>('LANDING');
@@ -54,17 +91,37 @@ export function App() {
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [toastMessage, setToastMessage] = useState<string | null>(null);
   const [incomingInvite, setIncomingInvite] = useState<LobbyInvite | null>(null);
-  const [soundEnabled, setSoundEnabled] = useState(true);
+  const [soundEnabled, setSoundEnabled] = useState(() => {
+    return loadGamePreferences().soundEnabled;
+  });
+  const [boardTheme, setBoardTheme] = useState<BoardThemeId>(() => {
+    if (typeof window !== 'undefined') {
+      const prefs = loadGamePreferences();
+      if (prefs.defaultTheme && prefs.defaultTheme in BOARD_THEMES) return prefs.defaultTheme;
+      const saved = localStorage.getItem('nueve_board_theme') as BoardThemeId | null;
+      if (saved && saved in BOARD_THEMES) return saved;
+    }
+    return 'midnight';
+  });
 
   // Network and Offline Mode State
   const isOnline = useOnlineStatus();
   const [isOfflineMatch, setIsOfflineMatch] = useState(false);
+  const [isDailyChallengeActive, setIsDailyChallengeActive] = useState(false);
   const offlineSolutionRef = useRef<number[][] | null>(null);
+  const offlineBoardRef = useRef<number[][] | null>(null);
   const offlineFilledRef = useRef<number>(0);
   const offlineTotalEmptyRef = useRef<number>(0);
   const offlineMistakesRef = useRef<number>(0);
   const offlineStartTimeRef = useRef<number>(0);
   const offlineBotIntervalsRef = useRef<Array<ReturnType<typeof setInterval>>>([]);
+
+  // Advanced Performance Scoring & Streak Refs
+  const comboStreakRef = useRef<number>(0);
+  const maxComboRef = useRef<number>(0);
+  const lastMoveTimeRef = useRef<number | null>(null);
+  const accumulatedScoreRef = useRef<number>(0);
+  const hintsUsedRef = useRef<number>(0);
 
   // Restore authenticated user session on mount
   useEffect(() => {
@@ -141,6 +198,11 @@ export function App() {
     });
 
     socket.on('game:started', (startedRoom: RoomPublicState) => {
+      comboStreakRef.current = 0;
+      maxComboRef.current = 0;
+      lastMoveTimeRef.current = null;
+      accumulatedScoreRef.current = 0;
+      hintsUsedRef.current = 0;
       setRoom(startedRoom);
       setView('GAME');
       setErrorMessage(null);
@@ -194,9 +256,8 @@ export function App() {
   };
 
   const toggleSound = () => {
-    const next = !soundEnabled;
+    const next = soundEngine.toggleSound();
     setSoundEnabled(next);
-    soundEngine.enabled = next;
   };
 
   const handleAuthSuccess = (user: UserAccount, token: string, remember: boolean = true) => {
@@ -273,7 +334,11 @@ export function App() {
     }
   };
 
-  const handleCreateRoom = (difficulty: DifficultyLevel) => {
+  const handleCreateRoom = (
+    difficulty: DifficultyLevel,
+    feedbackMode?: 'instant' | 'delayed',
+    customClues?: number
+  ) => {
     if (!socketRef.current) return;
     setIsSubmitting(true);
     setErrorMessage(null);
@@ -285,6 +350,8 @@ export function App() {
         avatarId,
         difficulty,
         userId: currentUser?.id,
+        feedbackMode: feedbackMode || 'instant',
+        customClues: difficulty === 'Custom' ? customClues : undefined,
       },
       (res: { ok: boolean; room?: RoomPublicState; error?: string }) => {
         setIsSubmitting(false);
@@ -298,25 +365,49 @@ export function App() {
     );
   };
 
-  const handleStartOfflineGame = (difficulty: DifficultyLevel) => {
+  const handleStartOfflineGame = (
+    difficulty: DifficultyLevel,
+    customSeed?: string,
+    feedbackMode?: 'instant' | 'delayed',
+    customClues?: number
+  ) => {
     // Clear any active offline bots
     offlineBotIntervalsRef.current.forEach(clearInterval);
     offlineBotIntervalsRef.current = [];
 
-    const puzzle = generateSudokuBoard(difficulty);
+    const puzzle =
+      customSeed && customSeed.trim()
+        ? generateSudokuBoardFromSeed(customSeed.trim())
+        : generateSudokuBoard(
+            difficulty,
+            undefined,
+            difficulty === 'Custom' ? customClues : undefined
+          );
+
+    const actualDifficulty = 'difficulty' in puzzle ? (puzzle as any).difficulty : difficulty;
+
     offlineSolutionRef.current = puzzle.solutionBoard;
+    offlineBoardRef.current = puzzle.initialBoard.map((row) => [...row]);
     offlineFilledRef.current = 0;
     offlineTotalEmptyRef.current = puzzle.emptyCellsCount;
     offlineMistakesRef.current = 0;
     offlineStartTimeRef.current = Date.now();
+    comboStreakRef.current = 0;
+    maxComboRef.current = 0;
+    lastMoveTimeRef.current = null;
+    accumulatedScoreRef.current = 0;
+    hintsUsedRef.current = 0;
     setIsOfflineMatch(true);
 
     const offlineRoom: RoomPublicState = {
       code: 'OFFLINE',
       hostId: 'offline-player',
-      difficulty,
+      difficulty: actualDifficulty,
       status: 'PLAYING',
       maxPlayers: 2,
+      puzzleSeed: puzzle.seed,
+      feedbackMode: feedbackMode || 'instant',
+      customClues: difficulty === 'Custom' ? customClues : undefined,
       players: [
         {
           id: 'offline-player',
@@ -409,6 +500,92 @@ export function App() {
     offlineBotIntervalsRef.current.push(botTimer);
   };
 
+  const handleStartDailyChallenge = async () => {
+    try {
+      setIsSubmitting(true);
+      setErrorMessage(null);
+      // Fetch today's high-difficulty board
+      const res = await fetch('/api/daily-challenge');
+      const data = await res.json();
+      if (!data.ok || !data.challenge) {
+        showToast('Could not load Daily Challenge.');
+        setIsSubmitting(false);
+        return;
+      }
+
+      const challenge = data.challenge;
+      offlineBotIntervalsRef.current.forEach(clearInterval);
+      offlineBotIntervalsRef.current = [];
+
+      offlineSolutionRef.current = challenge.solutionBoard || solveSudoku(challenge.initialBoard);
+      offlineBoardRef.current = challenge.initialBoard.map((row: number[]) => [...row]);
+      offlineFilledRef.current = 0;
+      offlineTotalEmptyRef.current = challenge.totalEmptyCells;
+      offlineMistakesRef.current = 0;
+      offlineStartTimeRef.current = Date.now();
+      comboStreakRef.current = 0;
+      maxComboRef.current = 0;
+      lastMoveTimeRef.current = null;
+      accumulatedScoreRef.current = 0;
+      hintsUsedRef.current = 0;
+      setIsOfflineMatch(true);
+      setIsDailyChallengeActive(true);
+
+      const dailyRoom: RoomPublicState = {
+        code: 'DAILY',
+        hostId: 'offline-player',
+        difficulty: challenge.difficulty,
+        status: 'PLAYING',
+        maxPlayers: 1,
+        puzzleSeed: challenge.puzzleSeed,
+        players: [
+          {
+            id: 'offline-player',
+            userId: currentUser?.id,
+            name: playerName.trim() || 'Daily Challenger',
+            avatarId,
+            isHost: true,
+            isReady: true,
+            isBot: false,
+            connected: true,
+            filledCount: 0,
+            totalToFill: challenge.totalEmptyCells,
+            mistakes: 0,
+            finished: false,
+            finishTimeMs: null,
+            deltaTSeconds: null,
+            rank: null,
+            score: null,
+            maxPossibleScore: null,
+            minPossibleScore: null,
+          },
+        ],
+        startTime: Date.now(),
+        firstFinishTimeMs: null,
+        initialBoard: challenge.initialBoard,
+        messages: [
+          {
+            id: `msg-daily-${Date.now()}`,
+            senderId: 'system',
+            senderName: 'System',
+            senderAvatarId: 'avatar-dragon',
+            text: `🔥 Daily Challenge Active! ${challenge.difficulty} difficulty · 24h Window. Solve accurately for streak & 'Daily Master' / 'Committed' badges!`,
+            timestamp: Date.now(),
+          },
+        ],
+      };
+
+      setRoom(dailyRoom);
+      setSocketId('offline-player');
+      setView('GAME');
+      setIsSubmitting(false);
+      showToast(`🔥 Daily Challenge Started (${challenge.difficulty})`);
+    } catch (err) {
+      setIsSubmitting(false);
+      showToast('Network error loading Daily Challenge.');
+    }
+  };
+
   const handleJoinRoom = (code: string) => {
     if (!socketRef.current) return;
     setIsSubmitting(true);
@@ -451,12 +628,15 @@ export function App() {
       );
     } else {
       // Create a private room and send the invite
+      const prefs = loadGamePreferences();
       socketRef.current.emit(
         'room:create',
         {
           playerName: playerName.trim() || 'Player 1',
           avatarId,
-          difficulty: 'Medium',
+          difficulty: prefs.defaultDifficulty || 'Medium',
+          feedbackMode: prefs.defaultFeedbackMode,
+          customClues: prefs.defaultDifficulty === 'Custom' ? prefs.defaultCustomClues : undefined,
           userId: currentUser?.id,
         },
         (res: { ok: boolean; room?: RoomPublicState; error?: string }) => {
@@ -491,11 +671,11 @@ export function App() {
     );
   };
 
-  const handleSetDifficulty = (difficulty: DifficultyLevel) => {
+  const handleSetDifficulty = (difficulty: DifficultyLevel, customClues?: number) => {
     if (!socketRef.current) return;
     socketRef.current.emit(
       'room:set_difficulty',
-      { difficulty },
+      { difficulty, customClues },
       (res: { ok: boolean; error?: string }) => {
         if (!res.ok && res.error) {
           setErrorMessage(res.error);
@@ -567,6 +747,19 @@ export function App() {
     );
   };
 
+  const handleSetMistakeLimit = (mistakeLimit: number) => {
+    if (!socketRef.current) return;
+    socketRef.current.emit(
+      'room:set_mistake_limit',
+      { mistakeLimit },
+      (res: { ok: boolean; error?: string }) => {
+        if (!res.ok && res.error) {
+          setErrorMessage(res.error);
+        }
+      }
+    );
+  };
+
   const handleSubmitMove = (
     row: number,
     col: number,
@@ -576,17 +769,43 @@ export function App() {
     if (isOfflineMatch) {
       const solution = offlineSolutionRef.current;
       if (!solution) return;
-      const correct = solution[row][col] === value;
-      if (correct) {
+
+      // Cannot overwrite an already occupied cell
+      if (offlineBoardRef.current && offlineBoardRef.current[row][col] !== 0) {
+        return cb({ ok: false, error: 'Hücre zaten bir sayıyla dolu ve değiştirilemez.' });
+      }
+
+      // Delayed / Self-Checking mode (no immediate approved or wrong feedback)
+      if (room?.feedbackMode === 'delayed') {
+        if (offlineBoardRef.current) {
+          offlineBoardRef.current[row][col] = value;
+        }
         offlineFilledRef.current++;
         const isDone = offlineFilledRef.current >= offlineTotalEmptyRef.current;
         const elapsed = Math.max(0, Date.now() - offlineStartTimeRef.current);
-        const score = calculateCompetitiveScore(
-          elapsed,
-          offlineMistakesRef.current,
-          room?.difficulty || 'Medium',
-          1
-        );
+
+        let finalMistakes = 0;
+        if (isDone && solution && offlineBoardRef.current) {
+          for (let r = 0; r < 9; r++) {
+            for (let c = 0; c < 9; c++) {
+              if (offlineBoardRef.current[r][c] !== solution[r][c]) {
+                finalMistakes++;
+              }
+            }
+          }
+          offlineMistakesRef.current = finalMistakes;
+        }
+
+        const advancedScore = calculateAdvancedPerformanceScore({
+          difficulty: room?.difficulty || 'Medium',
+          finishTimeMs: elapsed,
+          mistakes: offlineMistakesRef.current,
+          hintsUsed: hintsUsedRef.current,
+          accumulatedScore: accumulatedScoreRef.current,
+          maxCombo: maxComboRef.current,
+          totalEmptyCells: offlineTotalEmptyRef.current,
+          customClues: room?.customClues,
+        });
 
         setRoom((prev) => {
           if (!prev) return prev;
@@ -599,9 +818,12 @@ export function App() {
                     ...p,
                     filledCount: offlineFilledRef.current,
                     finished: isDone,
-                    finishTimeMs: isDone ? elapsed : undefined,
-                    score: isDone ? score : p.score,
+                    finishTimeMs: isDone ? elapsed : null,
+                    score: isDone ? advancedScore.score : 0,
                     rank: isDone ? 1 : p.rank,
+                    mistakes: isDone ? finalMistakes : 0,
+                    difficultyMultiplier: advancedScore.difficultyMultiplier,
+                    timeMultiplier: advancedScore.difficultyMultiplier,
                   }
                 : p
             ),
@@ -611,31 +833,421 @@ export function App() {
         cb({
           ok: true,
           validation: {
+            row,
+            col,
+            value,
             correct: true,
+            mistakes: isDone ? finalMistakes : 0,
+            filledCount: offlineFilledRef.current,
+            totalToFill: offlineTotalEmptyRef.current,
             finished: isDone,
-            rank: 1,
-            score,
+            rank: isDone ? 1 : null,
+            score: isDone ? advancedScore.score : null,
+            liveScore: isDone ? advancedScore.score : 0,
+            comboStreak: 0,
+            comboMultiplier: 1,
+            speedBonus: 0,
+            pointsEarned: 0,
+            difficultyMultiplier: advancedScore.difficultyMultiplier,
+            timeMultiplier: advancedScore.difficultyMultiplier,
+            maxScoreCap: advancedScore.maxScoreCap,
+            hintsUsed: hintsUsedRef.current,
+            scoreBreakdown: advancedScore,
+            deltaTSeconds: 0,
           },
         });
-      } else {
-        offlineMistakesRef.current++;
+        return;
+      }
+
+      const correct = solution[row][col] === value;
+      const mistakeLimit = room?.mistakeLimit ?? 0;
+
+      if (correct) {
+        if (offlineBoardRef.current) {
+          offlineBoardRef.current[row][col] = value;
+        }
+        offlineFilledRef.current++;
+
+        // 1. Kural: Ard arda hızlıca bulunan hücre ekstra puan (kombo ve hız bonusu)
+        const moveScoreResult = calculateCellMoveScore(
+          room?.difficulty || 'Medium',
+          lastMoveTimeRef.current,
+          Date.now(),
+          comboStreakRef.current
+        );
+        lastMoveTimeRef.current = Date.now();
+        comboStreakRef.current = moveScoreResult.comboStreak;
+        maxComboRef.current = Math.max(maxComboRef.current, moveScoreResult.comboStreak);
+        accumulatedScoreRef.current += moveScoreResult.cellPointsEarned;
+
+        const isDone = offlineFilledRef.current >= offlineTotalEmptyRef.current;
+        const elapsed = Math.max(0, Date.now() - offlineStartTimeRef.current);
+
+        // 2, 3, 4, 5. Kurallar:
+        const advancedScore = calculateAdvancedPerformanceScore({
+          difficulty: room?.difficulty || 'Medium',
+          finishTimeMs: elapsed,
+          mistakes: offlineMistakesRef.current,
+          hintsUsed: hintsUsedRef.current,
+          accumulatedScore: accumulatedScoreRef.current,
+          maxCombo: maxComboRef.current,
+          totalEmptyCells: offlineTotalEmptyRef.current,
+          customClues: room?.customClues,
+        });
+        const score = advancedScore.score;
+
         setRoom((prev) => {
           if (!prev) return prev;
           return {
             ...prev,
+            status: isDone ? 'FINISHED' : prev.status,
             players: prev.players.map((p) =>
-              p.id === 'offline-player' ? { ...p, mistakes: p.mistakes + 1 } : p
+              p.id === 'offline-player'
+                ? {
+                    ...p,
+                    filledCount: offlineFilledRef.current,
+                    finished: isDone,
+                    finishTimeMs: isDone ? elapsed : null,
+                    score: isDone ? score : advancedScore.score,
+                    rank: isDone ? 1 : p.rank,
+                    hintsUsed: hintsUsedRef.current,
+                    comboStreak: comboStreakRef.current,
+                    maxCombo: maxComboRef.current,
+                    difficultyMultiplier: advancedScore.difficultyMultiplier,
+                    timeMultiplier: advancedScore.difficultyMultiplier,
+                    maxScoreCap: advancedScore.maxScoreCap,
+                    scoreBreakdown: advancedScore,
+                  }
+                : p
             ),
           };
         });
+
         cb({
           ok: true,
           validation: {
-            correct: false,
-            finished: false,
+            row,
+            col,
+            value,
+            correct: true,
+            mistakes: offlineMistakesRef.current,
+            filledCount: offlineFilledRef.current,
+            totalToFill: offlineTotalEmptyRef.current,
+            finished: isDone,
+            rank: isDone ? 1 : null,
+            score: isDone ? score : null,
+            liveScore: advancedScore.score,
+            comboStreak: moveScoreResult.comboStreak,
+            comboMultiplier: moveScoreResult.comboMultiplier,
+            speedBonus: moveScoreResult.speedBonus,
+            pointsEarned: moveScoreResult.cellPointsEarned,
+            difficultyMultiplier: advancedScore.difficultyMultiplier,
+            timeMultiplier: advancedScore.difficultyMultiplier,
+            maxScoreCap: advancedScore.maxScoreCap,
+            hintsUsed: hintsUsedRef.current,
+            scoreBreakdown: advancedScore,
+            deltaTSeconds: 0,
           },
         });
+
+        if (isDone) {
+          saveLocalMatchHistory({
+            id: `m_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+            timestamp: Date.now(),
+            difficulty: room?.difficulty || 'Medium',
+            rank: 1,
+            score: Math.round(score),
+            finishTimeMs: elapsed,
+            mistakes: offlineMistakesRef.current,
+            outcome: 'win',
+            totalPlayers: 2,
+            hintsUsed: hintsUsedRef.current,
+            maxCombo: maxComboRef.current,
+            timeMultiplier: advancedScore.timeMultiplier,
+            maxScoreCap: advancedScore.maxScoreCap,
+          });
+        }
+
+        if (isDone && isDailyChallengeActive) {
+          const playerKey =
+            currentUser?.id || localStorage.getItem('nueve_player_key') || playerName.trim() || 'guest';
+          fetch('/api/daily-challenge/submit', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              playerKey,
+              playerName: playerName.trim() || 'Daily Challenger',
+              avatarId,
+              userId: currentUser?.id,
+              finishTimeMs: elapsed,
+              mistakes: offlineMistakesRef.current,
+              score,
+            }),
+          })
+            .then((res) => res.json())
+            .then((resData) => {
+              if (resData.ok && resData.result) {
+                const res = resData.result;
+                let toast = `🔥 Daily Challenge Completed! Rank #${res.rank} · Streak: ${res.currentStreak} Days!`;
+                if (res.earnedDailyMasterBadge) {
+                  toast += ` 🏆 'Daily Master' Badge Earned!`;
+                }
+                if (res.earnedCommittedBadge) {
+                  toast += ` ⭐ 'Committed' Badge Unlocked!`;
+                }
+                showToast(toast);
+              }
+            })
+            .catch(() => {});
+        }
+      } else {
+        offlineMistakesRef.current++;
+        // 1 & 2. Kurallar: Hata seri/komboyu sıfırlar
+        comboStreakRef.current = 0;
+        lastMoveTimeRef.current = null;
+
+        const isEliminated = mistakeLimit > 0 && offlineMistakesRef.current >= mistakeLimit;
+        const elapsed = Math.max(0, Date.now() - offlineStartTimeRef.current);
+        const advancedScore = calculateAdvancedPerformanceScore({
+          difficulty: room?.difficulty || 'Medium',
+          finishTimeMs: elapsed,
+          mistakes: offlineMistakesRef.current,
+          hintsUsed: hintsUsedRef.current,
+          accumulatedScore: accumulatedScoreRef.current,
+          maxCombo: maxComboRef.current,
+          totalEmptyCells: offlineTotalEmptyRef.current,
+          customClues: room?.customClues,
+        });
+        const currentScore = isEliminated ? 0 : advancedScore.score;
+
+        setRoom((prev) => {
+          if (!prev) return prev;
+          return {
+            ...prev,
+            status: isEliminated ? 'FINISHED' : prev.status,
+            players: prev.players.map((p) =>
+              p.id === 'offline-player'
+                ? {
+                    ...p,
+                    mistakes: offlineMistakesRef.current,
+                    finished: isEliminated ? true : p.finished,
+                    isEliminated,
+                    finishTimeMs: isEliminated ? elapsed : p.finishTimeMs,
+                    rank: isEliminated ? 2 : p.rank,
+                    score: isEliminated ? 0 : currentScore,
+                    hintsUsed: hintsUsedRef.current,
+                    comboStreak: 0,
+                    maxCombo: maxComboRef.current,
+                    difficultyMultiplier: advancedScore.difficultyMultiplier,
+                    timeMultiplier: advancedScore.difficultyMultiplier,
+                    maxScoreCap: advancedScore.maxScoreCap,
+                    scoreBreakdown: advancedScore,
+                  }
+                : p
+            ),
+          };
+        });
+
+        cb({
+          ok: true,
+          validation: {
+            row,
+            col,
+            value,
+            correct: false,
+            mistakes: offlineMistakesRef.current,
+            filledCount: offlineFilledRef.current,
+            totalToFill: offlineTotalEmptyRef.current,
+            finished: isEliminated,
+            rank: isEliminated ? 2 : null,
+            score: isEliminated ? 0 : null,
+            liveScore: currentScore,
+            comboStreak: 0,
+            comboMultiplier: 1.0,
+            speedBonus: 0,
+            pointsEarned: 0,
+            difficultyMultiplier: advancedScore.difficultyMultiplier,
+            timeMultiplier: advancedScore.difficultyMultiplier,
+            maxScoreCap: advancedScore.maxScoreCap,
+            hintsUsed: hintsUsedRef.current,
+            scoreBreakdown: advancedScore,
+            deltaTSeconds: null,
+            isEliminated,
+          },
+        });
+
+        if (isEliminated) {
+          saveLocalMatchHistory({
+            id: `m_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+            timestamp: Date.now(),
+            difficulty: room?.difficulty || 'Medium',
+            rank: 2,
+            score: 0,
+            finishTimeMs: elapsed,
+            mistakes: offlineMistakesRef.current,
+            outcome: 'loss',
+            totalPlayers: 2,
+            eliminated: true,
+            hintsUsed: hintsUsedRef.current,
+            maxCombo: maxComboRef.current,
+            timeMultiplier: advancedScore.timeMultiplier,
+            maxScoreCap: advancedScore.maxScoreCap,
+          });
+        }
       }
+      return;
+    }
+
+    // Online Multiplayer: Local gameplay with instant 0ms move verification & live results/time sync to others
+    if (room && room.solutionBoard) {
+      const solution = room.solutionBoard;
+      const isCorrect = solution[row][col] === value;
+      const me = room.players.find((p) => p.id === socketId);
+      const prevFilled = me?.filledCount || 0;
+      const prevMistakes = me?.mistakes || 0;
+      const totalToFill = me?.totalToFill || 40;
+      const mistakeLimit = room.mistakeLimit ?? 0;
+
+      let moveScoreResult = {
+        isCombo: false,
+        comboStreak: 1,
+        comboMultiplier: 1.0,
+        speedBonus: 0,
+        cellPointsEarned: 0,
+        timeSinceLastMoveSeconds: 0,
+      };
+
+      if (isCorrect) {
+        moveScoreResult = calculateCellMoveScore(
+          room.difficulty,
+          lastMoveTimeRef.current,
+          Date.now(),
+          comboStreakRef.current
+        );
+        lastMoveTimeRef.current = Date.now();
+        comboStreakRef.current = moveScoreResult.comboStreak;
+        maxComboRef.current = Math.max(maxComboRef.current, moveScoreResult.comboStreak);
+        accumulatedScoreRef.current += moveScoreResult.cellPointsEarned;
+      } else {
+        comboStreakRef.current = 0;
+        lastMoveTimeRef.current = null;
+      }
+
+      const newFilled = isCorrect ? prevFilled + 1 : prevFilled;
+      const newMistakes = !isCorrect ? prevMistakes + 1 : prevMistakes;
+      const isEliminated = mistakeLimit > 0 && newMistakes >= mistakeLimit;
+      const isDone = newFilled >= totalToFill || isEliminated;
+      const elapsed = room.startTime ? Math.max(100, Date.now() - room.startTime) : 0;
+
+      const advancedScore = calculateAdvancedPerformanceScore({
+        difficulty: room.difficulty,
+        finishTimeMs: elapsed,
+        mistakes: newMistakes,
+        hintsUsed: hintsUsedRef.current,
+        accumulatedScore: accumulatedScoreRef.current,
+        maxCombo: maxComboRef.current,
+        totalEmptyCells: totalToFill,
+        customClues: room.customClues,
+      });
+
+      const score = isEliminated ? 0 : advancedScore.score;
+      const rank = isEliminated ? room.players.length : isDone ? 1 : null;
+
+      // Update local state instantly with 0ms delay
+      setRoom((prev) => {
+        if (!prev) return prev;
+        return {
+          ...prev,
+          players: prev.players.map((p) =>
+            p.id === socketId
+              ? {
+                  ...p,
+                  filledCount: newFilled,
+                  mistakes: newMistakes,
+                  finished: isDone,
+                  finishTimeMs: isDone ? elapsed : null,
+                  isEliminated,
+                  score: isDone ? score : advancedScore.score,
+                  rank: isDone ? rank : p.rank,
+                  hintsUsed: hintsUsedRef.current,
+                  comboStreak: comboStreakRef.current,
+                  maxCombo: maxComboRef.current,
+                  difficultyMultiplier: advancedScore.difficultyMultiplier,
+                  timeMultiplier: advancedScore.difficultyMultiplier,
+                  maxScoreCap: advancedScore.maxScoreCap,
+                  scoreBreakdown: advancedScore,
+                }
+              : p
+          ),
+        };
+      });
+
+      // Synchronize results and periodic telemetry to other players
+      socketRef.current?.emit('player:sync_progress', {
+        filledCount: newFilled,
+        mistakes: newMistakes,
+        finished: isDone,
+        finishTimeMs: isDone ? elapsed : undefined,
+        isEliminated,
+        score,
+        hintsUsed: hintsUsedRef.current,
+        comboStreak: comboStreakRef.current,
+        maxCombo: maxComboRef.current,
+        difficultyMultiplier: advancedScore.difficultyMultiplier,
+        timeMultiplier: advancedScore.difficultyMultiplier,
+        maxScoreCap: advancedScore.maxScoreCap,
+        scoreBreakdown: advancedScore,
+      });
+
+      // Immediate callback to local game arena
+      cb({
+        ok: true,
+        validation: {
+          row,
+          col,
+          value,
+          correct: isCorrect,
+          mistakes: newMistakes,
+          filledCount: newFilled,
+          totalToFill,
+          finished: isDone,
+          rank,
+          score: isDone ? score : null,
+          liveScore: score,
+          comboStreak: moveScoreResult.comboStreak,
+          comboMultiplier: moveScoreResult.comboMultiplier,
+          speedBonus: moveScoreResult.speedBonus,
+          pointsEarned: moveScoreResult.cellPointsEarned,
+          difficultyMultiplier: advancedScore.difficultyMultiplier,
+          timeMultiplier: advancedScore.difficultyMultiplier,
+          maxScoreCap: advancedScore.maxScoreCap,
+          hintsUsed: hintsUsedRef.current,
+          scoreBreakdown: advancedScore,
+          deltaTSeconds: 0,
+          isEliminated,
+        },
+      });
+
+      // Save match outcome to Match History when match completes
+      if (isDone) {
+        saveLocalMatchHistory({
+          id: `m_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+          timestamp: Date.now(),
+          difficulty: room.difficulty,
+          rank: rank || 1,
+          score: Math.round(score),
+          finishTimeMs: elapsed,
+          mistakes: newMistakes,
+          outcome: !isEliminated && rank === 1 ? 'win' : 'loss',
+          totalPlayers: room.players.length,
+          eliminated: isEliminated,
+          hintsUsed: hintsUsedRef.current,
+          maxCombo: maxComboRef.current,
+          timeMultiplier: advancedScore.timeMultiplier,
+          maxScoreCap: advancedScore.maxScoreCap,
+        });
+      }
+
       return;
     }
 
@@ -660,6 +1272,59 @@ export function App() {
 
     if (!socketRef.current) return;
     socketRef.current.emit('game:undo_move', { row, col });
+  };
+
+  const handleUseHint = (
+    row: number,
+    col: number
+  ): { ok: boolean; digit?: number; cap?: number; error?: string } => {
+    const activeSolution = isOfflineMatch ? offlineSolutionRef.current : room?.solutionBoard;
+    if (!activeSolution) {
+      showToast('Çözüm tahtası henüz hazır değil.');
+      return { ok: false, error: 'Solution not ready' };
+    }
+    const correctVal = activeSolution[row]?.[col];
+    if (!correctVal) {
+      showToast('Lütfen geçerli bir hücre seçin.');
+      return { ok: false, error: 'Invalid cell' };
+    }
+
+    hintsUsedRef.current += 1;
+    const diff = room?.difficulty || 'Medium';
+    const currentMistakes = isOfflineMatch
+      ? offlineMistakesRef.current
+      : (room?.players.find((p) => p.id === socketId)?.mistakes || 0);
+
+    const cap = calculateMaxScoreCap(diff, currentMistakes, hintsUsedRef.current);
+
+    // If online, update player state and sync to others
+    if (!isOfflineMatch && room) {
+      setRoom((prev) => {
+        if (!prev) return prev;
+        return {
+          ...prev,
+          players: prev.players.map((p) =>
+            p.id === socketId
+              ? {
+                  ...p,
+                  hintsUsed: hintsUsedRef.current,
+                  maxScoreCap: cap,
+                }
+              : p
+          ),
+        };
+      });
+
+      socketRef.current?.emit('player:sync_progress', {
+        filledCount: room.players.find((p) => p.id === socketId)?.filledCount || 0,
+        mistakes: currentMistakes,
+        hintsUsed: hintsUsedRef.current,
+        maxScoreCap: cap,
+      });
+    }
+
+    showToast(`💡 Yardım kullanıldı! Bu oyun için maksimum puan ${cap ?? 0} pts ile sınırlandırıldı.`);
+    return { ok: true, digit: correctVal, cap: cap ?? undefined };
   };
 
   const handleReturnToLobby = () => {
@@ -796,7 +1461,7 @@ export function App() {
               className="px-2.5 sm:px-3 py-1.5 rounded-xl bg-[#131B2E] hover:bg-slate-800 border border-slate-700/80 text-xs font-semibold text-amber-300 flex items-center gap-1.5 transition-colors cursor-pointer min-h-[36px]"
             >
               <LogIn className="w-3.5 h-3.5 text-amber-400" />
-              <span>Sign In</span>
+              <span className="hidden sm:inline">Sign In</span>
             </button>
           )}
 
@@ -830,6 +1495,18 @@ export function App() {
 
           {/* Lo-Fi Background Music Controller */}
           <BgmController />
+
+          {/* Global Game Settings & Defaults Button */}
+          <button
+            type="button"
+            onClick={() => setShowSettingsModal(true)}
+            className="p-2 sm:px-2.5 sm:py-2 text-xs font-semibold text-slate-300 bg-[#131B2E] border border-slate-800 rounded-xl hover:text-white hover:bg-slate-800 transition-colors flex items-center justify-center gap-1.5 whitespace-nowrap cursor-pointer min-w-[36px] min-h-[36px]"
+            title="Oyun Ayarları & Varsayılan Kurallar"
+            aria-label="Oyun Ayarları"
+          >
+            <Settings className="w-3.5 h-3.5 text-amber-400" />
+            <span className="hidden lg:inline text-slate-300">Ayarlar</span>
+          </button>
 
           <button
             type="button"
@@ -867,11 +1544,13 @@ export function App() {
             playerName={playerName}
             avatarId={avatarId}
             currentUser={currentUser}
+            onOpenSettings={() => setShowSettingsModal(true)}
             onOpenProfile={() => setShowProfileModal(true)}
             onOpenAuth={() => setShowAuthModal(true)}
             onCreateRoom={handleCreateRoom}
             onJoinRoom={handleJoinRoom}
             onStartOfflineGame={handleStartOfflineGame}
+            onStartDailyChallenge={handleStartDailyChallenge}
             onOpenLeaderboard={() => setView('LEADERBOARD')}
             isSubmitting={isSubmitting}
             errorMessage={errorMessage}
@@ -886,6 +1565,7 @@ export function App() {
             currentPlayerId={socketId}
             onToggleReady={handleToggleReady}
             onSetDifficulty={handleSetDifficulty}
+            onSetMistakeLimit={handleSetMistakeLimit}
             onStartGame={handleStartGame}
             onAddBot={handleAddBot}
             onRemoveBot={handleRemoveBot}
@@ -908,6 +1588,8 @@ export function App() {
             onDeleteMessage={handleDeleteChatMessage}
             onLeaveRoom={handleLeaveRoom}
             onUndoMove={handleUndoMove}
+            onUseHint={handleUseHint}
+            boardThemeId={boardTheme}
           />
         )}
 
@@ -931,6 +1613,8 @@ export function App() {
           currentUser={currentUser}
           authToken={authToken}
           currentRoomCode={room?.code || null}
+          currentThemeId={boardTheme}
+          onSelectTheme={setBoardTheme}
           onSave={handleSaveProfile}
           onLogout={handleLogout}
           onOpenAuth={() => setShowAuthModal(true)}
@@ -940,6 +1624,10 @@ export function App() {
           onJoinRoomCode={handleJoinRoom}
           onUserUpdated={(updated) => setCurrentUser(updated)}
           socket={socketRef.current}
+          onOpenSettings={() => {
+            setShowProfileModal(false);
+            setShowSettingsModal(true);
+          }}
         />
       )}
 
@@ -955,6 +1643,17 @@ export function App() {
           }}
         />
       )}
+
+      {/* Global Settings & Defaults Modal */}
+      <SettingsModal
+        isOpen={showSettingsModal}
+        onClose={() => setShowSettingsModal(false)}
+        onSavePreferences={(newPrefs) => {
+          setSoundEnabled(newPrefs.soundEnabled);
+          setBoardTheme(newPrefs.defaultTheme);
+          showToast('Oyun ayarları ve varsayılanlar kaydedildi!');
+        }}
+      />
 
       {/* Incoming Lobby Invitation Card */}
       {incomingInvite && (
